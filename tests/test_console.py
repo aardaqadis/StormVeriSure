@@ -86,6 +86,57 @@ class ConsoleTests(unittest.TestCase):
         self.assertNotIn("\x1b[", stderr.getvalue())
         self.assertEqual(stdout.getvalue(), "")
 
+    def test_eta_appears_after_measurable_progress(self):
+        stderr = io.StringIO()
+        console = Console(stdout=io.StringIO(), stderr=stderr,
+                          progress_interval=0, heartbeat_interval=3600)
+        with patch("stormcopy.console.time.monotonic", side_effect=[100.0, 130.0]):
+            console.progress({"phase": "download", "done": 0, "total": 10})
+            console.progress({"phase": "download", "done": 5, "total": 10})
+        console.finish_progress()
+        lines = stderr.getvalue().splitlines()
+        self.assertNotIn("ETA", lines[0])
+        self.assertIn("ETA ~30.0s", lines[1])
+
+    def test_eta_is_omitted_for_unknown_total_or_complete_phase(self):
+        for first, last in (({"phase": "download", "done": 0},
+                             {"phase": "download", "done": 5}),
+                            ({"phase": "download", "done": 0, "total": 10},
+                             {"phase": "download", "done": 10, "total": 10})):
+            with self.subTest(last=last):
+                stderr = io.StringIO()
+                console = Console(stdout=io.StringIO(), stderr=stderr,
+                                  progress_interval=0, heartbeat_interval=3600)
+                with patch("stormcopy.console.time.monotonic", side_effect=[100.0, 130.0]):
+                    console.progress(first)
+                    console.progress(last)
+                console.finish_progress()
+                self.assertNotIn("ETA", stderr.getvalue())
+
+    def test_eta_waits_for_elapsed_time(self):
+        stderr = io.StringIO()
+        console = Console(stdout=io.StringIO(), stderr=stderr,
+                          progress_interval=0, heartbeat_interval=3600)
+        with patch("stormcopy.console.time.monotonic", side_effect=[100.0, 101.0]):
+            console.progress({"phase": "download", "done": 0, "total": 10})
+            console.progress({"phase": "download", "done": 2, "total": 10})
+        console.finish_progress()
+        self.assertNotIn("ETA", stderr.getvalue())
+
+    def test_eta_remains_visible_in_eighty_column_terminal(self):
+        stderr = FakeTTY()
+        console = Console(stdout=io.StringIO(), stderr=stderr,
+                          heartbeat_interval=3600)
+        with patch("stormcopy.console.shutil.get_terminal_size",
+                   return_value=os.terminal_size((80, 24))), \
+             patch("stormcopy.console.time.monotonic", side_effect=[100.0, 130.0]):
+            console.progress({"phase": "Workshop download", "done": 0,
+                              "total": 800000})
+            console.progress({"phase": "Workshop download", "done": 500000,
+                              "total": 800000})
+        console.finish_progress()
+        self.assertIn("ETA ~18.0s", stderr.getvalue())
+
     def test_tty_bar_and_no_color_opt_out(self):
         with patch("stormcopy.console._enable_windows_vt", return_value=True), \
              patch.dict(os.environ, {"TERM": "xterm"}, clear=True):

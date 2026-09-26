@@ -6,7 +6,6 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import errno
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -21,13 +20,27 @@ from zipfile import BadZipFile, ZipFile
 from uuid import uuid4
 
 from .index import ensure_download_columns, get_state, index_file, set_state, upsert_item
+from .credentials import get_api_key
 from . import search_index
 
 APP_ID = 573090
+MAX_DOWNLOAD_WORKERS = 16
 DISCOVERY_SCOPE_VERSION = 2
+REFRESH_OVERLAP_SECONDS = 7 * 86400
+AUTO_REFRESH_INTERVAL_SECONDS = 6 * 3600
+FULL_RESCAN_SECONDS = 30 * 86400
 API_URL = "https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/"
 DETAILS_URL = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
 STEAMCMD_URL = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
+_RATE_LIMIT_OUTPUT = re.compile(
+    r"rate[\s_-]*limit(?:ed|ing)?|too\s+many\s+requests|"
+    r"\b(?:http(?:/\d(?:\.\d)?)?(?:\s+error)?|status(?:\s+code)?|error)\s*"
+    r"(?:[:=#-]\s*)?429\b", re.I)
+
+
+def _steamcmd_rate_limited(output):
+    """Require an actual status or rate-limit phrase, not digits in an item ID."""
+    return bool(_RATE_LIMIT_OUTPUT.search(output))
 
 
 def setup_steamcmd(cache, force=False):
@@ -179,55 +192,106 @@ def _request_json(url, delay, data=None):
     raise RuntimeError("Steam API retries exhausted")
 
 
+def _discovery_suffix(tags, excluded_tags, match_all):
+    """Keep separate cursors and refresh watermarks for each tag query."""
+    if not tags and not excluded_tags:
+        return ""
+    signature = json.dumps({"tags": sorted(tags),
+                            "exclude": sorted(excluded_tags),
+                            "all": bool(match_all)}, sort_keys=True, separators=(",", ":"))
+    return "_" + hashlib.sha256(signature.encode()).hexdigest()[:16]
+
+
+def _put_state(db, key, value):
+    """Write state inside the caller's transaction."""
+    db.execute("INSERT INTO state VALUES (?,?) ON CONFLICT(key) "
+               "DO UPDATE SET value=excluded.value", (key, str(value)))
+
+
+def _query_files(api_key, delay, sort, cursor, tags, excluded_tags, match_all):
+    payload = {"query_type": 1 if sort == "published" else 21,
+               "appid": APP_ID, "filetype": 0, "cursor": cursor,
+               "numperpage": 100, "return_tags": True,
+               "return_short_description": True}
+    if tags:
+        payload["requiredtags"] = list(tags)
+        payload["match_all_tags"] = bool(match_all)
+    if excluded_tags:
+        payload["excludedtags"] = list(excluded_tags)
+    url = API_URL + "?" + urllib.parse.urlencode({"key": api_key,
+                                                   "input_json": json.dumps(payload, separators=(",", ":"))})
+    try:
+        envelope = _request_json(url, delay)
+    except RuntimeError as exc:
+        if str(exc) == "Steam API HTTP 403":
+            raise RuntimeError(
+                "Steam denied Workshop discovery (HTTP 403). Check the Steam "
+                "Web API key at https://steamcommunity.com/dev/apikey and "
+                "replace the saved value with `py -3 -m stormcopy set-api-key "
+                "--prompt`. A STEAM_API_KEY set in this Command Prompt "
+                "overrides the saved value."
+            ) from exc
+        raise
+    response = envelope.get("response")
+    if not isinstance(response, dict) or response.get("result", 1) != 1:
+        raise RuntimeError(f"Steam QueryFiles rejected the request: {response}")
+    files = response.get("publishedfiledetails", [])
+    if not isinstance(files, list):
+        raise RuntimeError("Steam QueryFiles returned an invalid item list")
+    return response, files
+
+
 def discover(db, max_pages=1, delay=2.0, api_key=None, resume=True, sort="published",
              tags=(), excluded_tags=(), match_all=True, progress=None):
     ensure_download_columns(db)
     if max_pages < 0 or delay < 0:
         raise ValueError("pages and delay must be nonnegative")
     tags, excluded_tags = _check_tag_filters(tags, excluded_tags)
-    api_key = api_key or os.environ.get("STEAM_API_KEY")
+    api_key = get_api_key(api_key)
     if not api_key:
         raise ValueError("Set STEAM_API_KEY to use Workshop discovery")
     if sort not in ("published", "updated"):
         raise ValueError("sort must be published or updated")
-    suffix = ""
-    if tags or excluded_tags:
-        signature = json.dumps({"tags": sorted(tags),
-                                "exclude": sorted(excluded_tags),
-                                "all": bool(match_all)}, sort_keys=True, separators=(",", ":"))
-        suffix = "_" + hashlib.sha256(signature.encode()).hexdigest()[:16]
+    suffix = _discovery_suffix(tags, excluded_tags, match_all)
     # Earlier cursors were scoped to creations made by the game's account.
     # They cannot resume an all-creators traversal without skipping items.
     cursor_key = f"cursor_v{DISCOVERY_SCOPE_VERSION}_{sort}{suffix}"
     complete_key = f"discovery_complete_v{DISCOVERY_SCOPE_VERSION}_{sort}{suffix}"
+    started_key = f"full_started_v1{suffix}"
+    completed_key = f"full_completed_v1{suffix}"
+    watermark_key = f"refresh_watermark_v1{suffix}"
     if resume and get_state(db, complete_key) == "1":
         return {"pages": 0, "items_seen": 0, "sort": sort, "complete": True,
                 "tags": tags, "excluded_tags": excluded_tags}
     cursor = get_state(db, cursor_key, "*") if resume else "*"
+    if not resume:
+        with db:
+            _put_state(db, cursor_key, "*")
+            _put_state(db, complete_key, "0")
+            if sort == "published":
+                _put_state(db, started_key, int(time.time()))
+                db.execute("DELETE FROM state WHERE key IN (?,?,?)",
+                           (f"refresh_cursor_v1{suffix}",
+                            f"refresh_started_v1{suffix}",
+                            f"refresh_cutoff_v1{suffix}"))
+    elif sort == "published" and cursor == "*" and get_state(db, started_key) is None:
+        # Old partial crawls lack a trustworthy start time. Leave them without
+        # a seed so their first later refresh scans the full updated listing.
+        set_state(db, started_key, int(time.time()))
     total = pages = 0
     if progress is not None:
         progress({"phase": "Discover", "done": 0, "total": max_pages or None,
                   "detail": "contacting Steam Workshop"})
     while max_pages == 0 or pages < max_pages:
-        payload = {"query_type": 1 if sort == "published" else 21,
-                   "appid": APP_ID,
-                   "filetype": 0, "cursor": cursor, "numperpage": 100,
-                   "return_tags": True, "return_short_description": True}
-        if tags:
-            payload["requiredtags"] = list(tags)
-            payload["match_all_tags"] = bool(match_all)
-        if excluded_tags:
-            payload["excludedtags"] = list(excluded_tags)
-        url = API_URL + "?" + urllib.parse.urlencode({"key": api_key,
-                                                       "input_json": json.dumps(payload, separators=(",", ":"))})
-        envelope = _request_json(url, delay)
-        response = envelope.get("response")
-        if not isinstance(response, dict) or response.get("result", 1) != 1:
-            raise RuntimeError(f"Steam QueryFiles rejected the request: {response}")
-        files = response.get("publishedfiledetails", [])
+        response, files = _query_files(api_key, delay, sort, cursor, tags,
+                                       excluded_tags, match_all)
+        next_cursor = response.get("next_cursor")
+        if next_cursor and next_cursor == cursor:
+            raise RuntimeError("Steam returned the same discovery cursor twice; rerun to retry")
+        complete = not next_cursor
         with db:
             for item in files:
-                if item.get("result", 1) != 1 or not item.get("publishedfileid"):
+                if not isinstance(item, dict) or item.get("result", 1) != 1 or not item.get("publishedfileid"):
                     continue
                 if not _item_matches_tags(item, tags, excluded_tags, match_all):
                     continue
@@ -235,24 +299,171 @@ def discover(db, max_pages=1, delay=2.0, api_key=None, resume=True, sort="publis
                             item.get("time_updated"), _size(item.get("file_size")), commit=False)
                 _save_item_tags(db, item)
                 total += 1
+            _put_state(db, cursor_key, "*" if complete else next_cursor)
+            _put_state(db, complete_key, "1" if complete else "0")
+            if complete and sort == "published":
+                _put_state(db, completed_key, int(time.time()))
+                started = get_state(db, started_key)
+                if started is not None:
+                    _put_state(db, watermark_key, started)
         pages += 1
         if progress is not None:
-            query_total = _size(response.get("total"))
+            # A resumed cursor starts its page count at zero. Steam's reported
+            # overall result count cannot be used as this run's progress total.
             progress({"phase": "Discover", "done": pages,
-                      "total": max_pages or (math.ceil(query_total / 100) if query_total else None),
+                      "total": max_pages or None,
                       "detail": f"{total:,} matching items found"})
-        next_cursor = response.get("next_cursor")
-        if not files or not next_cursor or next_cursor == cursor:
-            set_state(db, complete_key, "1")
-            set_state(db, cursor_key, "*")
+        if complete:
             break
         cursor = next_cursor
-        set_state(db, cursor_key, cursor)
-        set_state(db, complete_key, "0")
     set_state(db, "last_discovery", str(int(time.time())))
     return {"pages": pages, "items_seen": total, "sort": sort,
             "complete": get_state(db, complete_key) == "1",
             "tags": tags, "excluded_tags": excluded_tags}
+
+
+def refresh_recent(db, max_pages=1, delay=2.0, api_key=None, tags=(),
+                   excluded_tags=(), match_all=True, progress=None,
+                   overlap_seconds=REFRESH_OVERLAP_SECONDS):
+    """Resume one last-updated sweep; advance its watermark only on completion."""
+    ensure_download_columns(db)
+    if max_pages < 0 or delay < 0 or overlap_seconds < 0:
+        raise ValueError("pages, delay, and overlap must be nonnegative")
+    tags, excluded_tags = _check_tag_filters(tags, excluded_tags)
+    api_key = get_api_key(api_key)
+    if not api_key:
+        raise ValueError("Set STEAM_API_KEY to use Workshop discovery")
+    suffix = _discovery_suffix(tags, excluded_tags, match_all)
+    cursor_key = f"refresh_cursor_v1{suffix}"
+    started_key = f"refresh_started_v1{suffix}"
+    cutoff_key = f"refresh_cutoff_v1{suffix}"
+    watermark_key = f"refresh_watermark_v1{suffix}"
+    completed_key = f"refresh_completed_v1{suffix}"
+    started = get_state(db, started_key)
+    if started is None:
+        # The pass start, rather than the newest item observed, is the next
+        # watermark: updates arriving while pages are read remain eligible on
+        # the following pass.
+        started = int(time.time())
+        previous = int(get_state(db, watermark_key, "0"))
+        cutoff = max(0, previous - overlap_seconds)
+        cursor = "*"
+        with db:
+            _put_state(db, started_key, started)
+            _put_state(db, cutoff_key, cutoff)
+            _put_state(db, cursor_key, cursor)
+    else:
+        started = int(started)
+        cutoff = int(get_state(db, cutoff_key, "0"))
+        cursor = get_state(db, cursor_key, "*")
+
+    pages = total = 0
+    complete = False
+    if progress is not None:
+        progress({"phase": "Refresh", "done": 0, "total": max_pages or None,
+                  "detail": "checking recently updated Workshop items"})
+    while max_pages == 0 or pages < max_pages:
+        response, files = _query_files(api_key, delay, "updated", cursor,
+                                       tags, excluded_tags, match_all)
+        next_cursor = response.get("next_cursor")
+        if next_cursor and next_cursor == cursor:
+            raise RuntimeError("Steam returned the same refresh cursor twice; rerun to retry")
+        # Query type 21 is newest first. Cross the cutoff strictly so all
+        # items sharing its timestamp are included; unknown times require a
+        # deeper walk rather than an unsafe early stop.
+        timestamps = []
+        for item in files:
+            if not isinstance(item, dict):
+                timestamps.append(None)
+                continue
+            try:
+                timestamp = int(item.get("time_updated"))
+            except (TypeError, ValueError):
+                timestamp = 0
+            timestamps.append(timestamp if timestamp > 0 else None)
+        past_cutoff = bool(cutoff and timestamps and
+                           all(timestamp is not None for timestamp in timestamps) and
+                           any(timestamp < cutoff for timestamp in timestamps))
+        complete = past_cutoff or not next_cursor
+        with db:
+            for item in files:
+                if (not isinstance(item, dict) or item.get("result", 1) != 1 or
+                        not item.get("publishedfileid")):
+                    continue
+                if not _item_matches_tags(item, tags, excluded_tags, match_all):
+                    continue
+                upsert_item(db, item["publishedfileid"], item.get("title"),
+                            item.get("time_updated"), _size(item.get("file_size")), commit=False)
+                _save_item_tags(db, item)
+                total += 1
+            if complete:
+                _put_state(db, watermark_key, started)
+                _put_state(db, completed_key, int(time.time()))
+                db.execute("DELETE FROM state WHERE key IN (?,?,?)",
+                           (cursor_key, started_key, cutoff_key))
+            else:
+                _put_state(db, cursor_key, next_cursor)
+        pages += 1
+        if progress is not None:
+            progress({"phase": "Refresh", "done": pages,
+                      "total": max_pages or None,
+                      "detail": f"{total:,} items checked this pass"})
+        if complete:
+            break
+        cursor = next_cursor
+    set_state(db, "last_discovery", str(int(time.time())))
+    return {"pages": pages, "items_seen": total, "sort": "updated",
+            "mode": "refresh", "complete": complete,
+            "catalog_complete": get_state(
+                db, f"discovery_complete_v{DISCOVERY_SCOPE_VERSION}_published{suffix}") == "1",
+            "tags": tags, "excluded_tags": excluded_tags}
+
+
+def discover_catalog(db, max_pages=1, delay=2.0, api_key=None, restart=False,
+                     tags=(), excluded_tags=(), match_all=True, progress=None,
+                     refresh_interval_seconds=0):
+    """Finish the full crawl, then perform overlapping recent-update sweeps."""
+    if max_pages < 0 or delay < 0 or refresh_interval_seconds < 0:
+        raise ValueError("pages, delay, and refresh interval must be nonnegative")
+    tags, excluded_tags = _check_tag_filters(tags, excluded_tags)
+    api_key = get_api_key(api_key)
+    if not api_key:
+        raise ValueError("Set STEAM_API_KEY to use Workshop discovery")
+    ensure_download_columns(db)
+    suffix = _discovery_suffix(tags, excluded_tags, match_all)
+    full_complete_key = f"discovery_complete_v{DISCOVERY_SCOPE_VERSION}_published{suffix}"
+    full_completed_key = f"full_completed_v1{suffix}"
+    refresh_started_key = f"refresh_started_v1{suffix}"
+    refresh_completed_key = f"refresh_completed_v1{suffix}"
+    refresh_watermark_key = f"refresh_watermark_v1{suffix}"
+    full_complete = get_state(db, full_complete_key) == "1"
+    if full_complete and get_state(db, full_completed_key) is None:
+        # Existing databases know their crawl finished but not when. Begin a
+        # fresh 30-day schedule; no refresh watermark means one full updated
+        # sweep before the bounded overlapping refreshes can be trusted.
+        set_state(db, full_completed_key, int(time.time()))
+    last_full = int(get_state(db, full_completed_key, "0"))
+    refresh_active = get_state(db, refresh_started_key) is not None
+    due_full = full_complete and not refresh_active and (
+        int(time.time()) - last_full >= FULL_RESCAN_SECONDS)
+    if restart or not full_complete or due_full:
+        result = discover(db, max_pages=max_pages, delay=delay, api_key=api_key,
+                          resume=not (restart or due_full), sort="published",
+                          tags=tags, excluded_tags=excluded_tags,
+                          match_all=match_all, progress=progress)
+        return {**result, "mode": "full", "catalog_complete": result["complete"]}
+    last_refresh = int(get_state(db, refresh_completed_key, "0"))
+    refresh_age = int(time.time()) - last_refresh
+    if (not refresh_active and refresh_interval_seconds and last_refresh and
+            get_state(db, refresh_watermark_key) is not None and
+            0 <= refresh_age < refresh_interval_seconds):
+        return {"pages": 0, "items_seen": 0, "sort": "updated",
+                "mode": "refresh", "complete": True, "catalog_complete": True,
+                "skipped_recently": True, "tags": tags,
+                "excluded_tags": excluded_tags}
+    return refresh_recent(db, max_pages=max_pages, delay=delay, api_key=api_key,
+                          tags=tags, excluded_tags=excluded_tags,
+                          match_all=match_all, progress=progress)
 
 
 def refresh_tags(db, max_items=0, delay=0.5, force=False, progress=None):
@@ -406,7 +617,7 @@ def _cache_lock(cache):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _worker_homes(cache, steamcmd, workers):
+def _worker_homes(cache, steamcmd, workers, progress=None):
     """Give concurrent SteamCMD processes separate binaries and manifests."""
     source = Path(steamcmd)
     if not source.is_file():
@@ -421,6 +632,9 @@ def _worker_homes(cache, steamcmd, workers):
     root = cache / ".stormcopy-workers"
     root.mkdir(exist_ok=True)
     homes = []
+    if progress is not None:
+        progress({"phase": "Prepare workers", "done": 0, "total": workers,
+                  "detail": "setting up separate SteamCMD process folders"})
     for number in range(1, workers + 1):
         home = root / f"worker-{number}"
         home.mkdir(exist_ok=True)
@@ -440,6 +654,9 @@ def _worker_homes(cache, steamcmd, workers):
             # SteamCMD login state can change without updating steamcmd.exe.
             shutil.copytree(cache / "config", home / "config", dirs_exist_ok=True)
         homes.append((home, str(home / source.name)))
+        if progress is not None:
+            progress({"phase": "Prepare workers", "done": number, "total": workers,
+                      "detail": f"{number:,} SteamCMD process folders ready"})
     return homes
 
 
@@ -553,8 +770,10 @@ def download_pending(db, cache, steamcmd="steamcmd", max_items=50, delay=0.5,
                      cache_only=False, workers=1, tags=(), excluded_tags=(),
                      match_all=True, progress=None, workshop_folder=None,
                      skip_attempted=False):
-    if max_items < 0 or delay < 0 or batch_size < 1 or batch_size > 50 or not 1 <= workers <= 8:
-        raise ValueError("max-items and delay must be nonnegative; batch-size 1-50; workers 1-8")
+    if (max_items < 0 or delay < 0 or batch_size < 1 or batch_size > 50 or
+            not 1 <= workers <= MAX_DOWNLOAD_WORKERS):
+        raise ValueError("max-items and delay must be nonnegative; batch-size 1-50; "
+                         f"workers 1-{MAX_DOWNLOAD_WORKERS}")
     if skip_attempted and max_items == 0:
         raise ValueError("skip_attempted requires a positive max-items chunk size")
     cache = Path(cache).resolve()
@@ -611,14 +830,22 @@ def _download_pending_locked(db, cache, steamcmd, max_items, delay, login, batch
     rows = db.execute(sql, params + ((max_items,) if max_items else ())).fetchall()
     done = failed = no_vehicle = unindexed = 0
     rate_limited = False
+    throttle_until = 0.0
     known_sizes = sum(row["size_bytes"] is not None for row in rows)
-    batches = [(start, rows[start:start + batch_size])
-               for start in range(0, len(rows), batch_size)]
+    requested_workers = workers
+    # Small queues split into ten-item batches may not occupy every requested
+    # process. Smaller batches expose enough work to the isolated workers.
+    effective_batch_size = (min(batch_size, max(1, len(rows) // workers))
+                            if workers > 1 and rows else batch_size)
+    batches = [(start, rows[start:start + effective_batch_size])
+               for start in range(0, len(rows), effective_batch_size)]
+    workers = min(workers, len(batches)) if batches else 0
+    homes = (_worker_homes(cache, steamcmd, workers, progress) if workers > 1
+             else [(cache, steamcmd)])
+    active = {}
     if progress is not None:
         progress({"phase": "Download", "done": 0, "total": len(rows),
                   "detail": "smallest reported files first"})
-    workers = min(workers, len(batches)) if batches else 0
-    homes = _worker_homes(cache, steamcmd, workers) if workers > 1 else [(cache, steamcmd)]
 
     def command_for(batch, home, executable):
         command = [executable, "+force_install_dir", str(home), "+login", login]
@@ -627,7 +854,7 @@ def _download_pending_locked(db, cache, steamcmd, max_items, delay, login, batch
         return command + ["+quit"]
 
     def record_batch(start, batch, home, result, output):
-        nonlocal done, failed, no_vehicle, unindexed, rate_limited
+        nonlocal done, failed, no_vehicle, unindexed, rate_limited, throttle_until
 
         def warn(message):
             if progress is not None:
@@ -701,9 +928,14 @@ def _download_pending_locked(db, cache, steamcmd, max_items, delay, login, batch
                 failed += 1
         if progress is not None:
             progress({"phase": "Download", "done": done + failed, "total": len(rows),
-                      "detail": f"{done:,} cached, {failed:,} failed; {workers} worker(s)"})
-        throttled = bool(re.search(r"429|rate.?limit|too many requests", output, re.I))
+                      "active": len(active),
+                      "cached_count": done, "failed_count": failed,
+                      "worker_count": workers,
+                      "detail": f"{done:,} cached, {failed:,} failed; {workers} process(es)"})
+        throttled = _steamcmd_rate_limited(output)
         rate_limited = rate_limited or throttled
+        if throttled:
+            throttle_until = max(throttle_until, time.monotonic() + 30.0)
         return throttled
 
     if batches and workers == 1:
@@ -713,16 +945,15 @@ def _download_pending_locked(db, cache, steamcmd, max_items, delay, login, batch
                 print(f"Downloading {start + 1}-{start + len(batch)}/{len(rows)} "
                       f"(smallest reported files first)", file=sys.stderr, flush=True)
             result, output = _run_batch(command_for(batch, home, executable), home, len(batch))
-            throttled = record_batch(start, batch, home, result, output)
+            record_batch(start, batch, home, result, output)
             if batch_number + 1 < len(batches):
-                time.sleep(max(delay, 5.0) if throttled else delay)
+                wait_for = max(delay, throttle_until - time.monotonic())
+                if wait_for > 0:
+                    time.sleep(wait_for)
     elif batches:
         next_batch = 0
         next_launch = 0.0
-        throttle_until = 0.0
         allowed_workers = workers
-        active = {}
-
         def launch(pool, number):
             nonlocal next_batch, next_launch
             start, batch = batches[next_batch]
@@ -738,6 +969,10 @@ def _download_pending_locked(db, cache, steamcmd, max_items, delay, login, batch
             future = pool.submit(_run_batch, command_for(batch, home, executable), home, len(batch))
             active[future] = (number, start, batch, home)
             next_launch = time.monotonic() + delay
+            if progress is not None:
+                progress({"phase": "Download", "done": done + failed,
+                          "total": len(rows), "active": len(active),
+                          "detail": f"{workers} SteamCMD process slots"})
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             for number in range(workers):
@@ -748,7 +983,6 @@ def _download_pending_locked(db, cache, steamcmd, max_items, delay, login, batch
                     number, start, batch, home = active.pop(future)
                     result, output = future.result()
                     if record_batch(start, batch, home, result, output):
-                        throttle_until = max(throttle_until, time.monotonic() + 30.0)
                         allowed_workers = max(1, allowed_workers // 2)
                         warning = ("Steam reported a rate limit; pausing new batches and "
                                    f"reducing to {allowed_workers} worker(s)")
@@ -764,7 +998,10 @@ def _download_pending_locked(db, cache, steamcmd, max_items, delay, login, batch
             "failed": failed, "reported_sizes_known": known_sizes,
             "reported_sizes_unknown": len(rows) - known_sizes,
             "batches": len(batches), "workers_used": workers,
+            "workers_requested": requested_workers,
+            "batch_size_used": effective_batch_size,
             "rate_limited": rate_limited,
+            "cooldown_remaining_seconds": max(0.0, throttle_until - time.monotonic()),
             "elapsed_seconds": round(time.monotonic() - started, 1),
             "tags": tags, "excluded_tags": excluded_tags,
             "workshop_folder": str(destination_root)}

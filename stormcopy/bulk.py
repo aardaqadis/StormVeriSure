@@ -7,6 +7,7 @@ import shutil
 import time
 
 from . import steam
+from .credentials import get_api_key
 from .index import ensure_download_columns
 
 
@@ -158,7 +159,7 @@ def _check_steamcmd(cache, steamcmd, workers):
 
 def download_workshop(db, workshop_folder=None, cache="steam-cache", steamcmd="steamcmd",
                       *, known_only=False, pages=0, restart_discovery=False,
-                      max_items=0, chunk_size=50, workers=4, batch_size=10,
+                      max_items=0, chunk_size=100, workers=4, batch_size=10,
                       delay=0.5, metadata_delay=0.5, login="anonymous",
                       reserve_free_gb=20.0, download_only=False, progress=None,
                       api_key=None):
@@ -168,13 +169,15 @@ def download_workshop(db, workshop_folder=None, cache="steam-cache", steamcmd="s
     pass does not turn into an unbounded in-memory SteamCMD queue. The SQLite
     discovery cursor and item states are committed throughout the run.
     """
+    if not 1 <= workers <= steam.MAX_DOWNLOAD_WORKERS:
+        raise ValueError(f"processes must be between 1 and {steam.MAX_DOWNLOAD_WORKERS}")
     if (pages < 0 or max_items < 0 or not 1 <= chunk_size <= 500 or
-            not 1 <= workers <= 8 or not 1 <= batch_size <= 50 or
+            not 1 <= batch_size <= 50 or
             delay < 0 or metadata_delay < 0 or reserve_free_gb < 0):
-        raise ValueError("Invalid pages, item, chunk, worker, batch, delay, or disk-reserve value")
+        raise ValueError("Invalid pages, item, chunk, batch, delay, or disk-reserve value")
     if known_only and restart_discovery:
         raise ValueError("--known-only cannot be combined with --restart-discovery")
-    api_key = api_key or os.environ.get("STEAM_API_KEY")
+    api_key = get_api_key(api_key)
     if not known_only and not api_key:
         raise ValueError("Set STEAM_API_KEY to discover most public Workshop items, "
                          "or use --known-only for items already in the index")
@@ -190,9 +193,11 @@ def download_workshop(db, workshop_folder=None, cache="steam-cache", steamcmd="s
     started = time.monotonic()
     discovery = None
     if not known_only:
-        discovery = steam.discover(db, max_pages=pages, delay=metadata_delay,
-                                   api_key=api_key, resume=not restart_discovery,
-                                   progress=progress)
+        discovery = steam.discover_catalog(db, max_pages=pages, delay=metadata_delay,
+                                           api_key=api_key, restart=restart_discovery,
+                                           progress=progress,
+                                           refresh_interval_seconds=
+                                               steam.AUTO_REFRESH_INTERVAL_SECONDS)
     existing = adopt_existing(db, destination, progress=progress)
     # QueryFiles normally supplies size metadata. Bound the public details
     # refresh for older locally known IDs so bulk downloading can start.
@@ -200,9 +205,11 @@ def download_workshop(db, workshop_folder=None, cache="steam-cache", steamcmd="s
                                 pending_only=True, progress=progress)
     initial_pending, initial_eligible = _pending_counts(db)
     target = min(initial_eligible, max_items) if max_items else initial_eligible
+    download_started = time.monotonic()
     attempted = downloaded = failed = indexed = no_vehicle = 0
     batches = 0
     active_workers = workers
+    peak_workers_used = 0
     unthrottled_chunks = 0
     stop_reason = "queue empty"
     reserve_bytes = int(reserve_free_gb * 1024 ** 3)
@@ -210,10 +217,27 @@ def download_workshop(db, workshop_folder=None, cache="steam-cache", steamcmd="s
     def show(event):
         if progress is None:
             return
-        if event.get("phase") == "Download":
-            event = {**event, "phase": "Workshop download",
-                     "done": attempted + (event.get("done") or 0),
+        if event.get("phase") == "Prepare workers":
+            event = {**event, "phase": "Workshop download", "done": attempted,
                      "total": target}
+        elif event.get("phase") == "Download":
+            aggregate_done = attempted + (event.get("done") or 0)
+            event = {**event, "phase": "Workshop download",
+                     "done": aggregate_done,
+                     "total": target}
+            if "cached_count" in event:
+                cached_count = downloaded + event.pop("cached_count")
+                failed_count = failed + event.pop("failed_count")
+                worker_count = event.pop("worker_count")
+                event["detail"] = (f"{cached_count:,} cached, {failed_count:,} failed; "
+                                   f"{worker_count} process(es)")
+        if event.get("phase") == "Workshop download":
+            aggregate_done = event.get("done") or 0
+            elapsed = time.monotonic() - download_started
+            if event.get("warning"):
+                event["eta_paused"] = True
+            elif target > aggregate_done >= 2 and elapsed >= 2:
+                event["eta_seconds"] = elapsed * (target - aggregate_done) / aggregate_done
         progress(event)
 
     # A failed small item can become eligible again during a very long run.
@@ -248,20 +272,26 @@ def download_workshop(db, workshop_folder=None, cache="steam-cache", steamcmd="s
             indexed += result["downloaded_and_indexed"]
             no_vehicle += result["cached_without_vehicle"]
             batches += result["batches"]
+            peak_workers_used = max(peak_workers_used, result.get("workers_used", 0))
             if max_items and attempted >= max_items:
                 stop_reason = "item limit reached"
                 break
             if result.get("rate_limited"):
                 active_workers = max(1, active_workers // 2)
                 unthrottled_chunks = 0
+                cooldown = max(0.0, result.get("cooldown_remaining_seconds", 30.0))
                 if progress is not None:
                     progress({"phase": "Workshop download", "done": attempted,
                               "total": target,
-                              "warning": "Steam asked us to slow down; waiting before the next group"})
-                time.sleep(30)
+                              "eta_paused": cooldown > 0,
+                              "warning": ("Steam asked us to slow down; waiting before the next group"
+                                          if cooldown > 0 else
+                                          "Steam asked us to slow down; continuing with fewer workers")})
+                if cooldown:
+                    time.sleep(cooldown)
             else:
                 unthrottled_chunks += 1
-                if unthrottled_chunks >= 5 and active_workers < workers:
+                if unthrottled_chunks >= 2 and active_workers < workers:
                     active_workers += 1
                     unthrottled_chunks = 0
     finally:
@@ -275,7 +305,7 @@ def download_workshop(db, workshop_folder=None, cache="steam-cache", steamcmd="s
                            "AND id NOT GLOB '*[^0-9]*'").fetchone()[0]
     return {"workshop_folder": str(destination), "staging_cache": str(cache),
             "discovery": discovery, "discovery_complete":
-                discovery["complete"] if discovery else None,
+                discovery.get("catalog_complete", discovery["complete"]) if discovery else None,
             "existing": existing, "size_refresh": sizes,
             "known_items": known, "in_workshop_folder": in_folder,
             "initial_pending": initial_pending, "attempted": attempted,
@@ -283,5 +313,7 @@ def download_workshop(db, workshop_folder=None, cache="steam-cache", steamcmd="s
             "cached_without_vehicle": no_vehicle, "failed": failed,
             "remaining_pending": pending, "remaining_eligible": eligible,
             "waiting_to_retry": pending - eligible,
-            "batches": batches, "stop_reason": stop_reason,
+            "batches": batches, "workers_requested": workers,
+            "peak_workers_used": peak_workers_used,
+            "stop_reason": stop_reason,
             "elapsed_seconds": round(time.monotonic() - started, 1)}

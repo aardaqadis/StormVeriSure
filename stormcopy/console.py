@@ -5,6 +5,7 @@ module is only a presentation layer; ``--json`` keeps the original data format.
 """
 
 import json
+import math
 import os
 import shutil
 import sys
@@ -77,6 +78,12 @@ def _duration(value):
         return "?"
     if seconds < 60:
         return f"{seconds:.1f}s"
+    if seconds >= 86400:
+        days, hours = divmod(int(seconds) // 3600, 24)
+        return f"{days}d {hours}h"
+    if seconds >= 3600:
+        hours, minutes = divmod(int(seconds) // 60, 60)
+        return f"{hours}h {minutes:02d}m"
     minutes, seconds = divmod(int(seconds), 60)
     return f"{minutes}m {seconds:02d}s"
 
@@ -91,7 +98,8 @@ class Console:
     """Render final dictionaries to stdout and progress events to stderr.
 
     Events are dictionaries with ``phase``, ``done``, ``total`` (optional), and
-    ``detail`` (optional). The caller may also provide ``failed`` and ``active``.
+    ``detail`` (optional). The caller may also provide ``failed``, ``active``,
+    or an explicit ``eta_seconds`` for progress spanning several phases.
     Call ``finish_progress`` before printing an unrelated diagnostic line.
     """
 
@@ -123,6 +131,7 @@ class Console:
         self._progress_active = False
         self._lock = threading.RLock()
         self._phase_started = None
+        self._phase_base_done = 0
         self._last_event = None
         self._heartbeat_stop = None
         self._heartbeat_interval = (heartbeat_interval if heartbeat_interval is not None
@@ -182,6 +191,10 @@ class Console:
             self._phase = phase
             self._last_report = float("-inf")
             self._phase_started = now
+            self._phase_base_done = done
+        elif done < self._phase_base_done:
+            self._phase_base_done = done
+            self._phase_started = now
 
         # A warning is a one-time line, not part of the repeated heartbeat.
         self._last_event = {key: value for key, value in event.items() if key != "warning"}
@@ -190,6 +203,21 @@ class Console:
             detail = (detail + " | " if detail else "") + f"elapsed {elapsed}"
 
         complete = total is not None and total > 0 and done >= total
+        eta = None
+        if not event.get("eta_paused") and total is not None and 0 < done < total:
+            supplied = event.get("eta_seconds")
+            if supplied is not None:
+                try:
+                    supplied = float(supplied)
+                except (TypeError, ValueError):
+                    supplied = None
+                if supplied is not None and math.isfinite(supplied) and supplied >= 0:
+                    eta = supplied
+            elif self._phase_started is not None:
+                elapsed_seconds = now - self._phase_started
+                advanced = done - self._phase_base_done
+                if elapsed_seconds >= 2 and advanced > 0:
+                    eta = elapsed_seconds * (total - done) / advanced
         if complete and self._heartbeat_stop is not None:
             self._heartbeat_stop.set()
             self._heartbeat_stop = None
@@ -197,24 +225,33 @@ class Console:
                                       now - self._last_report >= self.progress_interval):
             return
 
-        if total is not None and total > 0:
-            fraction = min(1.0, done / total)
-            width = 24
-            filled = int(width * fraction)
-            bar = "[" + "=" * filled + (">" if filled < width else "")
-            bar += "." * (width - filled - (filled < width)) + "]"
-            count = f"{_number(done)}/{_number(total)} ({fraction:.0%})"
-        else:
-            bar = "[working]"
-            count = f"{_number(done)} done" if done else ""
-        plain = f"{phase}: {bar} {count}".rstrip()
-        if detail:
-            plain += " | " + detail
+        columns = None
         if self._err_tty:
             try:
                 columns = os.get_terminal_size(self.stderr.fileno()).columns
             except (AttributeError, OSError, ValueError):
                 columns = shutil.get_terminal_size((100, 24)).columns
+        eta_label = f" | ETA ~{_duration(eta)}" if eta is not None else ""
+        if total is not None and total > 0:
+            fraction = min(1.0, done / total)
+            width = 24
+            count = f"{_number(done)}/{_number(total)} ({fraction:.0%})"
+            if columns is not None and eta_label:
+                # Keep the ETA visible even when a large Workshop count fills
+                # an ordinary 80-column Command Prompt window.
+                fixed = len(f"{phase}: [] {count}{eta_label}")
+                width = max(0, min(width, columns - 1 - fixed))
+            filled = int(width * fraction)
+            bar = "[" + "=" * filled + (">" if filled < width else "")
+            bar += "." * (width - filled - (filled < width)) + "]"
+        else:
+            bar = "[working]"
+            count = f"{_number(done)} done" if done else ""
+        plain = f"{phase}: {bar} {count}".rstrip()
+        plain += eta_label
+        if detail:
+            plain += " | " + detail
+        if self._err_tty:
             # A carriage return and padding work even when ANSI is unavailable.
             plain = plain[:max(1, columns - 1)]
             body = self._style(plain, "progress", self.stderr)
@@ -253,6 +290,7 @@ class Console:
         self._last_width = 0
         self._phase = None
         self._phase_started = None
+        self._phase_base_done = 0
         self._last_event = None
 
     def render(self, command, result):
@@ -290,6 +328,14 @@ class Console:
             self._line("SteamCMD ready", "heading")
             self._line(f"Location: {_clean(result.get('steamcmd'))}")
             self._line("Installed now" if result.get("installed") else "Already installed")
+        elif command == "set-api-key":
+            if result.get("saved"):
+                self._line("Steam API key saved for this Windows user", "heading")
+                self._line("Future Command Prompt sessions can use it automatically.")
+            else:
+                self._line("Saved Steam API key removed" if result.get("removed") else
+                           "No saved Steam API key was found", "heading")
+            self._line("A key set in this Command Prompt still takes precedence until it is closed.")
         else:
             self._line(_clean(command).replace("-", " ").title() + " complete", "heading")
             for key, value in result.items():
@@ -374,7 +420,7 @@ class Console:
                        f"{_number(coverage['modern_search_files'])} of "
                        f"{_number(coverage.get('indexed_files'))} vehicle files")
         if coverage.get("discovery_complete") is not None:
-            self._line("  Discovery pass complete: " +
+            self._line("  Full public catalog crawl complete: " +
                        ("yes" if coverage.get("discovery_complete") else "no"))
         if result.get("note"):
             self._line()
@@ -403,9 +449,13 @@ class Console:
                        f"Cached for later indexing: {_number(result.get('cached_unindexed'))}")
         if result.get("cached_without_vehicle"):
             self._line(f"Cached without vehicle XML: {_number(result['cached_without_vehicle'])}", "warning")
-        self._line(f"Batches: {_number(result.get('batches'))} | Workers: "
-                   f"{_number(result.get('workers_used'))} | Elapsed: "
+        self._line(f"Batches: {_number(result.get('batches'))} | SteamCMD processes: "
+                   f"{_number(result.get('workers_used'))} of "
+                   f"{_number(result.get('workers_requested', result.get('workers_used')))} requested | Elapsed: "
                    f"{_duration(result.get('elapsed_seconds'))}")
+        if result.get("batch_size_used") is not None:
+            self._line(f"Items per SteamCMD process: up to "
+                       f"{_number(result['batch_size_used'])}")
         if "reported_sizes_known" in result:
             self._line(f"Reported sizes known: {_number(result['reported_sizes_known'])} | "
                        f"Unknown: {_number(result.get('reported_sizes_unknown'))}")
@@ -419,9 +469,7 @@ class Console:
             self._line(f"Required tags: {required}" + (f" | Excluded: {excluded}" if excluded else ""))
             self._line(f"Search scope: {_clean(result.get('search_scope') or 'known items only')}")
         if result.get("discovery"):
-            discovery = result["discovery"]
-            self._line(f"Workshop pages searched now: {_number(discovery.get('pages'))}; "
-                       f"matching items found: {_number(discovery.get('items_seen'))}")
+            self._render_discovery_lines(result["discovery"])
         if result.get("tag_refresh"):
             self._line(f"Known item tags checked now: "
                        f"{_number(result['tag_refresh'].get('checked'))}")
@@ -433,9 +481,7 @@ class Console:
         self._line(f"Folder: {_clean(result.get('workshop_folder'), 240)}")
         discovery = result.get("discovery")
         if discovery is not None:
-            self._line(f"Public pages checked this run: {_number(discovery.get('pages'))} | "
-                       f"Public items found: {_number(discovery.get('items_seen'))} | "
-                       f"Discovery complete: {'yes' if result.get('discovery_complete') else 'no'}")
+            self._render_discovery_lines(discovery, result.get("discovery_complete"))
         else:
             self._line("Discovery: skipped; using already known item IDs")
         existing = result.get("existing") or {}
@@ -447,6 +493,8 @@ class Console:
         self._line(f"Tried this run: {_number(result.get('attempted'))} | "
                    f"Downloaded: {_number(result.get('downloaded'))} | "
                    f"Failed: {_number(result.get('failed'))}")
+        self._line(f"SteamCMD process slots: up to {_number(result.get('peak_workers_used'))} "
+                   f"of {_number(result.get('workers_requested'))} requested")
         self._line(f"Indexed now: {_number(result.get('indexed'))} | "
                    f"Still queued: {_number(result.get('remaining_pending'))} | "
                    f"Waiting to retry: {_number(result.get('waiting_to_retry'))}")
@@ -464,16 +512,38 @@ class Console:
 
     def _render_discover(self, result):
         self._line("Workshop discovery finished", "heading")
-        self._line(f"Pages checked: {_number(result.get('pages'))} | "
-                   f"Items found: {_number(result.get('items_seen'))}")
-        self._line(f"Order: {_clean(result.get('sort'))} | "
-                   f"Pass complete: {'yes' if result.get('complete') else 'no'}")
+        self._render_discovery_lines(result)
         if result.get("tags") or result.get("excluded_tags"):
             self._line("Required tags: " +
                        (", ".join(_clean(tag, 60) for tag in result.get("tags") or ()) or "any"))
             if result.get("excluded_tags"):
                 self._line("Excluded tags: " +
                            ", ".join(_clean(tag, 60) for tag in result["excluded_tags"]))
+
+    def _render_discovery_lines(self, discovery, catalog_complete=None):
+        mode = discovery.get("mode")
+        if mode == "full":
+            label = "Full published crawl"
+        elif mode == "refresh":
+            label = "Recent updates refresh"
+        elif discovery.get("sort") == "updated":
+            label = "Updated-order search"
+        else:
+            label = "Published-order search"
+        self._line(f"Discovery mode: {label}")
+        if discovery.get("skipped_recently"):
+            self._line("Recent update check: already completed within the last six hours")
+        self._line(f"Public pages checked this run: {_number(discovery.get('pages'))} | "
+                   f"Matching items found: {_number(discovery.get('items_seen'))}")
+        self._line("Current pass complete: " +
+                   ("yes" if discovery.get("complete") else "no"))
+        coverage = discovery.get("catalog_complete", catalog_complete)
+        if coverage is not None:
+            scope = ("Filtered Workshop crawl complete: " if
+                     discovery.get("tags") or discovery.get("excluded_tags") else
+                     "Full public catalog crawl complete: ")
+            self._line(scope +
+                       ("yes" if coverage else "no"))
 
     def _render_tags(self, result):
         self._line("Known Workshop tags", "heading")

@@ -1,4 +1,5 @@
 import argparse
+import getpass
 import os
 from pathlib import Path
 import sys
@@ -6,9 +7,11 @@ import sys
 from . import search_index
 from .bulk import download_workshop
 from .console import Console
+from .credentials import clear_api_key, get_api_key, save_api_key
 from .index import (connect, ensure_download_columns, index_directory, scan, upsert_item,
                     upgrade_search_index)
-from .steam import discover, download_pending, refresh_sizes, refresh_tags, setup_steamcmd
+from .steam import (AUTO_REFRESH_INTERVAL_SECONDS, discover, discover_catalog,
+                    download_pending, refresh_sizes, refresh_tags, setup_steamcmd)
 from .web import serve
 
 
@@ -35,8 +38,12 @@ def _scan_path(value, prompt_stream=None):
 
 
 def main():
+    if len(sys.argv) == 1:
+        from .gui import launch
+        launch(db_path="workshop.sqlite")
+        return
     parser = argparse.ArgumentParser(prog="stormcopy", description="Stormworks Workshop vehicle overlap detector")
-    parser.add_argument("--db", default="stormcopy.sqlite", help="persistent SQLite index path")
+    parser.add_argument("--db", help="persistent SQLite index path")
     parser.add_argument("--json", action="store_true", help="machine-readable result instead of a report")
     parser.add_argument("--no-color", action="store_true", help="disable terminal colours")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -49,11 +56,20 @@ def main():
     p.add_argument("item_id")
     p.add_argument("--title")
     p.add_argument("--size-bytes", type=int, help="optional reported Workshop file size")
-    p = sub.add_parser("discover", help="discover public item metadata with a Steam Web API key")
-    p.add_argument("--pages", type=int, default=1, help="pages this run; 0 means all remaining pages")
+    p = sub.add_parser("set-api-key", help="save a Steam Web API key for future Command Prompt sessions")
+    key_action = p.add_mutually_exclusive_group()
+    key_action.add_argument("--prompt", action="store_true",
+                            help="enter a replacement key without showing it on screen")
+    key_action.add_argument("--clear", action="store_true",
+                            help="remove the saved user key")
+    p = sub.add_parser("discover", help="resume a public crawl, then refresh recent Workshop changes")
+    p.add_argument("--pages", type=int, default=1,
+                   help="pages this run; 0 means finish the current crawl or refresh pass")
     p.add_argument("--delay", type=float, default=0.5, help="seconds between API pages")
-    p.add_argument("--restart", action="store_true")
-    p.add_argument("--sort", choices=("published", "updated"), default="published")
+    p.add_argument("--restart", action="store_true",
+                   help="start a new full crawl (or updated-only search with --sort updated)")
+    p.add_argument("--sort", choices=("published", "updated"), default="published",
+                   help="automatic crawl and refresh, or explicit updated-only search")
     p.add_argument("--tag", action="append", default=[], help="required Workshop tag; repeat to refine")
     p.add_argument("--exclude-tag", action="append", default=[], help="tag to exclude; repeatable")
     p.add_argument("--match-any", action="store_true", help="match any required tag instead of all")
@@ -74,8 +90,9 @@ def main():
     p.add_argument("--cache", default="steam-cache")
     p.add_argument("--max-items", type=int, default=50, help="items this run; 0 means all queued")
     p.add_argument("--batch-size", type=int, default=10, help="items per SteamCMD login (1-50)")
-    p.add_argument("--workers", type=int, default=4 if os.name == "nt" else 1,
-                   help="parallel isolated SteamCMD downloads (1-8; Windows default 4)")
+    p.add_argument("--workers", "--processes", dest="workers", type=int,
+                   default=4 if os.name == "nt" else 1,
+                   help="parallel isolated SteamCMD processes (1-16; Windows default 4)")
     p.add_argument("--delay", type=float, default=0.5, help="seconds between SteamCMD batches")
     p.add_argument("--login", default="anonymous", help="Steam account name if anonymous access fails")
     p.add_argument("--item-id", help="download one queued Workshop item ID")
@@ -87,20 +104,23 @@ def main():
     p.add_argument("--exclude-tag", action="append", default=[], help="skip items with this tag; repeatable")
     p.add_argument("--match-any", action="store_true", help="match any required tag instead of all")
     p.add_argument("--discover-pages", type=int, default=None,
-                   help="matching Workshop pages to search first; 0 means all remaining")
+                   help="matching Workshop pages to search first; 0 finishes the current pass")
     p.add_argument("--known-only", action="store_true", help="skip Workshop search; filter known IDs")
     p = sub.add_parser("download-workshop", help="fill your existing Steam Stormworks Workshop folder")
     p.add_argument("--workshop-folder", help="existing steamapps/workshop/content/573090 folder")
     p.add_argument("--cache", default="steam-cache", help="separate SteamCMD staging folder")
     p.add_argument("--steamcmd", default="steamcmd", help="SteamCMD executable or command name")
     p.add_argument("--known-only", action="store_true", help="download indexed IDs without API discovery")
-    p.add_argument("--pages", type=int, default=0, help="discovery pages this run; 0 means all remaining")
-    p.add_argument("--restart-discovery", action="store_true", help="start public Workshop discovery again")
+    p.add_argument("--pages", type=int, default=0,
+                   help="discovery pages this run; 0 finishes the current pass")
+    p.add_argument("--restart-discovery", action="store_true",
+                   help="restart the full published crawl from its first page")
     p.add_argument("--max-items", type=int, default=0, help="downloads to try this run; 0 means all queued")
-    p.add_argument("--chunk-size", type=int, default=50, help="maximum items held in each download queue")
+    p.add_argument("--chunk-size", type=int, default=100, help="maximum items held in each download queue")
     p.add_argument("--batch-size", type=int, default=10, help="items per SteamCMD login (1-50)")
-    p.add_argument("--workers", type=int, default=4 if os.name == "nt" else 1,
-                   help="parallel SteamCMD sessions (1-8; Windows default 4)")
+    p.add_argument("--workers", "--processes", dest="workers", type=int,
+                   default=4 if os.name == "nt" else 1,
+                   help="parallel SteamCMD processes (1-16; Windows default 4)")
     p.add_argument("--delay", type=float, default=0.5, help="seconds between SteamCMD batches")
     p.add_argument("--metadata-delay", type=float, default=0.5,
                    help="seconds between Workshop metadata requests")
@@ -112,6 +132,8 @@ def main():
     p = sub.add_parser("scan", help="compare a vehicle XML; prompts for a path if omitted")
     p.add_argument("xml", nargs="?", help="XML file path; omit to paste or drag it into Command Prompt")
     p.add_argument("--limit", type=int, default=5)
+    p = sub.add_parser("gui", help="open the plain Tkinter XML comparison window")
+    p.add_argument("--workshop-folder", help="existing local Steam Workshop folder")
     sub.add_parser("status", help="show how many Workshop files are currently indexed")
     p = sub.add_parser("serve", help="localhost upload interface")
     p.add_argument("--port", type=int, default=8765)
@@ -121,13 +143,35 @@ def main():
         command_parser.add_argument("--no-color", action="store_true", default=argparse.SUPPRESS,
                                     help="disable terminal colours")
     args = parser.parse_args()
+    if args.db is None:
+        args.db = "workshop.sqlite" if args.command == "gui" else "stormcopy.sqlite"
     console = Console(json_mode=args.json, color=not args.no_color)
     try:
+        if args.command == "gui":
+            from .gui import launch
+            launch(db_path=args.db, workshop_folder=args.workshop_folder)
+            return
         if args.command == "serve":
             serve(args.db, args.port)
             return
         if args.command == "setup-steamcmd":
             console.render(args.command, setup_steamcmd(args.cache, args.force))
+            return
+        if args.command == "set-api-key":
+            if args.clear:
+                result = clear_api_key()
+            else:
+                key = None if args.prompt else os.environ.get("STEAM_API_KEY")
+                if not key or not key.strip():
+                    if not sys.stdin.isatty():
+                        raise ValueError("Run set-api-key in an interactive Command Prompt "
+                                         "or set STEAM_API_KEY in this process first")
+                    try:
+                        key = getpass.getpass("Paste Steam Web API key: ")
+                    except EOFError as exc:
+                        raise ValueError("No Steam API key was entered") from exc
+                result = save_api_key(key)
+            console.render(args.command, result)
             return
         db = connect(args.db)
         try:
@@ -144,10 +188,16 @@ def main():
                 upsert_item(db, args.item_id, args.title, size_bytes=args.size_bytes)
                 result = {"queued": args.item_id}
             elif args.command == "discover":
-                result = discover(db, args.pages, args.delay, resume=not args.restart,
-                                  sort=args.sort, tags=args.tag,
-                                  excluded_tags=args.exclude_tag,
-                                  match_all=not args.match_any, progress=console.progress)
+                if args.sort == "published":
+                    result = discover_catalog(
+                        db, max_pages=args.pages, delay=args.delay, restart=args.restart,
+                        tags=args.tag, excluded_tags=args.exclude_tag,
+                        match_all=not args.match_any, progress=console.progress)
+                else:
+                    result = discover(db, args.pages, args.delay, resume=not args.restart,
+                                      sort=args.sort, tags=args.tag,
+                                      excluded_tags=args.exclude_tag,
+                                      match_all=not args.match_any, progress=console.progress)
             elif args.command == "tags":
                 if args.limit < 1:
                     raise ValueError("limit must be positive")
@@ -173,17 +223,18 @@ def main():
                     raise ValueError("--known-only cannot be combined with --discover-pages")
                 if args.discover_pages is not None and args.discover_pages < 0:
                     raise ValueError("discover-pages must be nonnegative")
-                api_key = os.environ.get("STEAM_API_KEY")
+                api_key = get_api_key()
                 if args.discover_pages is not None and not api_key:
                     raise ValueError("Set STEAM_API_KEY to search new Workshop pages")
                 pages = (args.discover_pages if args.discover_pages is not None else
                          1 if filtered and api_key and not args.known_only else None)
                 discovery = None
                 if pages is not None:
-                    discovery = discover(db, pages, api_key=api_key, tags=args.tag,
-                                         excluded_tags=args.exclude_tag,
-                                         match_all=not args.match_any,
-                                         progress=console.progress)
+                    discovery = discover_catalog(
+                        db, max_pages=pages, api_key=api_key, tags=args.tag,
+                        excluded_tags=args.exclude_tag, match_all=not args.match_any,
+                        progress=console.progress,
+                        refresh_interval_seconds=AUTO_REFRESH_INTERVAL_SECONDS)
                 tag_lookup = (refresh_tags(db, delay=args.metadata_delay,
                                            progress=console.progress)
                               if filtered else None)

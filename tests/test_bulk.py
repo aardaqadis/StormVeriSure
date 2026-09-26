@@ -98,6 +98,8 @@ class BulkWorkshopTests(unittest.TestCase):
             for number in range(101, 108):
                 upsert_item(db, str(number), updated=1, size_bytes=number)
             calls = []
+            events = []
+            clock = [100.0]
 
             def fake_download(connection, cache_path, **kwargs):
                 self.assertEqual(kwargs["workshop_folder"], folder.resolve())
@@ -109,6 +111,11 @@ class BulkWorkshopTests(unittest.TestCase):
                     "ORDER BY size_bytes LIMIT ?", (kwargs["max_items"],)).fetchall()
                 ids = [row[0] for row in rows]
                 calls.append(ids)
+                kwargs["progress"]({"phase": "Download", "done": 0,
+                                     "total": len(ids)})
+                clock[0] += 10.0
+                kwargs["progress"]({"phase": "Download", "done": len(ids),
+                                     "total": len(ids)})
                 connection.executemany("UPDATE items SET downloaded=? WHERE id=?",
                                        ((int(time.time()), item_id) for item_id in ids))
                 connection.commit()
@@ -117,19 +124,31 @@ class BulkWorkshopTests(unittest.TestCase):
                         "downloaded_and_indexed": len(ids),
                         "cached_without_vehicle": 0, "batches": 1}
 
-            with patch("stormcopy.bulk.steam.discover", return_value={
-                    "complete": True, "pages": 2, "items_seen": 7}) as discover, \
+            with patch("stormcopy.bulk.steam.discover_catalog", return_value={
+                    "complete": True, "catalog_complete": True,
+                    "pages": 2, "items_seen": 7}) as discover, \
                  patch("stormcopy.bulk.steam.refresh_sizes", return_value={
                      "checked": 0, "sizes_added": 0, "unknown_sizes": 0}), \
-                 patch("stormcopy.bulk.steam.download_pending", side_effect=fake_download):
+                 patch("stormcopy.bulk.steam.download_pending", side_effect=fake_download), \
+                 patch("stormcopy.bulk.time.monotonic", side_effect=lambda: clock[0]):
                 result = download_workshop(
                     db, folder, cache, known_only=False, api_key="test-key",
-                    max_items=5, chunk_size=3, workers=1, reserve_free_gb=0)
+                    max_items=5, chunk_size=3, workers=1, reserve_free_gb=0,
+                    progress=events.append)
             self.assertEqual([len(group) for group in calls], [3, 2])
+            download_events = [event for event in events
+                               if event.get("phase") == "Workshop download"]
+            self.assertEqual([event["done"] for event in download_events],
+                             [0, 3, 3, 5])
+            self.assertTrue(all(event["total"] == 5 for event in download_events))
+            # Starting a new 50-item-style chunk keeps the overall estimate.
+            self.assertGreater(download_events[1].get("eta_seconds") or 0, 0)
+            self.assertGreater(download_events[2].get("eta_seconds") or 0, 0)
             self.assertEqual((result["attempted"], result["downloaded"]), (5, 5))
             self.assertEqual(result["remaining_pending"], 2)
             self.assertEqual(result["stop_reason"], "item limit reached")
             self.assertEqual(discover.call_args.kwargs["max_pages"], 0)
+            self.assertFalse(discover.call_args.kwargs["restart"])
             db.close()
 
     def test_rate_limit_reduces_workers_between_chunks(self):
@@ -170,6 +189,100 @@ class BulkWorkshopTests(unittest.TestCase):
             sleep.assert_called_once_with(30)
             self.assertEqual(result["downloaded"], 6)
             db.close()
+
+    def test_elapsed_rate_limit_cooldown_does_not_pause_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = workshop_root(root)
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / "steamcmd.exe").write_bytes(b"MZ test")
+            db = connect(root / "index.sqlite")
+            for number in range(101, 105):
+                upsert_item(db, str(number), updated=1, size_bytes=number)
+            worker_counts = []
+
+            def fake_download(connection, _cache_path, **kwargs):
+                worker_counts.append(kwargs["workers"])
+                rows = connection.execute(
+                    "SELECT id FROM items WHERE downloaded=0 ORDER BY size_bytes LIMIT ?",
+                    (kwargs["max_items"],)).fetchall()
+                ids = [row[0] for row in rows]
+                connection.executemany("UPDATE items SET downloaded=? WHERE id=?",
+                                       ((int(time.time()), item_id) for item_id in ids))
+                connection.commit()
+                return {"selected": len(ids), "selected_ids": ids,
+                        "cached": len(ids), "failed": 0,
+                        "downloaded_and_indexed": len(ids),
+                        "cached_without_vehicle": 0, "batches": 1,
+                        "rate_limited": len(worker_counts) == 1,
+                        "cooldown_remaining_seconds": 0}
+
+            try:
+                with patch("stormcopy.bulk.steam.refresh_sizes", return_value={
+                        "checked": 0, "sizes_added": 0, "unknown_sizes": 0}), \
+                     patch("stormcopy.bulk.steam.download_pending", side_effect=fake_download), \
+                     patch("stormcopy.bulk.time.sleep") as sleep:
+                    result = download_workshop(db, folder, cache, known_only=True,
+                                               max_items=4, chunk_size=2, workers=4,
+                                               reserve_free_gb=0)
+                self.assertEqual(worker_counts, [4, 2])
+                sleep.assert_not_called()
+                self.assertEqual(result["downloaded"], 4)
+            finally:
+                db.close()
+
+    def test_prepare_workers_keeps_cumulative_download_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = workshop_root(root)
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / "steamcmd.exe").write_bytes(b"MZ test")
+            db = connect(root / "index.sqlite")
+            for number in range(101, 105):
+                upsert_item(db, str(number), updated=1, size_bytes=number)
+            events = []
+
+            def fake_download(connection, _cache_path, **kwargs):
+                rows = connection.execute(
+                    "SELECT id FROM items WHERE downloaded=0 ORDER BY size_bytes LIMIT ?",
+                    (kwargs["max_items"],)).fetchall()
+                ids = [row[0] for row in rows]
+                show = kwargs["progress"]
+                show({"phase": "Prepare workers", "done": 2, "total": 2,
+                      "detail": "2 SteamCMD process folders ready"})
+                show({"phase": "Download", "done": 0, "total": len(ids),
+                      "cached_count": 0, "failed_count": 0,
+                      "worker_count": kwargs["workers"]})
+                connection.executemany("UPDATE items SET downloaded=? WHERE id=?",
+                                       ((int(time.time()), item_id) for item_id in ids))
+                connection.commit()
+                show({"phase": "Download", "done": len(ids), "total": len(ids),
+                      "cached_count": len(ids), "failed_count": 0,
+                      "worker_count": kwargs["workers"]})
+                return {"selected": len(ids), "selected_ids": ids,
+                        "cached": len(ids), "failed": 0,
+                        "downloaded_and_indexed": len(ids),
+                        "cached_without_vehicle": 0, "batches": 1}
+
+            try:
+                with patch("stormcopy.bulk.steam.refresh_sizes", return_value={
+                        "checked": 0, "sizes_added": 0, "unknown_sizes": 0}), \
+                     patch("stormcopy.bulk.steam.download_pending", side_effect=fake_download):
+                    result = download_workshop(db, folder, cache, known_only=True,
+                                               max_items=4, chunk_size=2, workers=2,
+                                               reserve_free_gb=0, progress=events.append)
+                download_events = [event for event in events
+                                   if event.get("phase") == "Workshop download"]
+                self.assertEqual([event["done"] for event in download_events],
+                                 [0, 0, 2, 2, 2, 4])
+                self.assertTrue(all(event["total"] == 4 for event in download_events))
+                self.assertIn("2 cached, 0 failed", download_events[2]["detail"])
+                self.assertIn("4 cached, 0 failed", download_events[-1]["detail"])
+                self.assertEqual(result["downloaded"], 4)
+            finally:
+                db.close()
 
     def test_key_is_required_for_broad_discovery(self):
         with tempfile.TemporaryDirectory() as tmp:

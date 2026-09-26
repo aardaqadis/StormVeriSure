@@ -54,6 +54,22 @@ class SteamWorkshopFolderTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM items").fetchone()[0], 2)
             db.close()
 
+    def test_unbounded_resumed_discovery_does_not_claim_a_page_total(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = connect(Path(tmp) / "index.sqlite")
+            db.execute("INSERT INTO state VALUES (?,?)",
+                       ("cursor_v2_published", "next-wide"))
+            db.commit()
+            events = []
+            response = {"response": {"result": 1, "total": 100000,
+                                     "publishedfiledetails": [], "next_cursor": None}}
+            with patch("stormcopy.steam._request_json", return_value=response):
+                discover(db, max_pages=0, api_key="test-key", delay=0,
+                         progress=events.append)
+            self.assertEqual([event["done"] for event in events], [0, 1])
+            self.assertTrue(all(event["total"] is None for event in events))
+            db.close()
+
     def test_single_worker_promotes_into_existing_workshop_folder(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -274,6 +290,51 @@ class SteamWorkshopFolderTests(unittest.TestCase):
             self.assertEqual((result["selected"], result["failed"]), (1, 1))
             self.assertTrue(result["rate_limited"])
             db.close()
+
+    def test_successful_item_id_containing_429_does_not_trigger_rate_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "cache"
+            item_id = "1234294567"
+            db = connect(root / "index.sqlite")
+            upsert_item(db, item_id, updated=1, size_bytes=10)
+
+            def steamcmd(_command, **_kwargs):
+                folder = (cache / "steamapps" / "workshop" / "content" /
+                          "573090" / item_id)
+                folder.mkdir(parents=True)
+                (folder / "vehicle.xml").write_text("vehicle", encoding="utf-8")
+                return SimpleNamespace(returncode=0,
+                                       stdout=f"Success. Downloaded item {item_id}",
+                                       stderr="")
+
+            try:
+                with patch("stormcopy.steam.subprocess.run", side_effect=steamcmd):
+                    result = download_pending(db, cache, max_items=1, delay=0,
+                                              cache_only=True)
+                self.assertEqual((result["cached"], result["failed"]), (1, 0))
+                self.assertFalse(result["rate_limited"])
+            finally:
+                db.close()
+
+    def test_explicit_steamcmd_rate_limit_errors_are_detected(self):
+        for message in ("HTTP 429", "Rate Limit Exceeded", "Too Many Requests"):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                db = connect(root / "index.sqlite")
+                upsert_item(db, "101", updated=1, size_bytes=10)
+                response = SimpleNamespace(
+                    returncode=0,
+                    stdout=f"ERROR! Download item 101 failed ({message})",
+                    stderr="")
+                try:
+                    with patch("stormcopy.steam.subprocess.run", return_value=response):
+                        result = download_pending(db, root / "cache", max_items=1,
+                                                  delay=0, cache_only=True)
+                    self.assertEqual((result["selected"], result["failed"]), (1, 1))
+                    self.assertTrue(result["rate_limited"])
+                finally:
+                    db.close()
 
     def test_size_order_index_is_used_by_bounded_download_query(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -544,20 +544,27 @@ def _rank_match(db, query, theirs, item_id, candidate_path, total_files, df, leg
             "channels": channels, "confidence": confidence, "evidence": evidence}
 
 
-def scan(db, path, limit=5):
+def scan_fingerprint(db, fp, limit=5, legacy_fp=None):
+    """Compare a precomputed structural fingerprint with the indexed corpus.
+
+    ``legacy_fp`` enables searches of pre-upgrade rows. Remote callers omit it
+    because their requests contain no XML from which to build that older form.
+    """
     if limit < 1:
         raise ValueError("limit must be positive")
-    fp = fingerprint_file(path)
     total_files = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     indexed_items = db.execute("SELECT COUNT(DISTINCT item_id) FROM files").fetchone()[0]
     known_items = db.execute("SELECT COUNT(*) FROM items").fetchone()[0]
     search_files = db.execute("SELECT COUNT(*) FROM search_files").fetchone()[0]
     modern_files = db.execute("SELECT COUNT(*) FROM search_files WHERE version=?",
                               (search_index.SEARCH_INDEX_VERSION,)).fetchone()[0]
+    searched_files = total_files if legacy_fp is not None else search_files
     if not total_files:
         return {"status": "no index", "suspicion_level": "unknown",
                 "message": "Index Workshop XML first.",
-                "coverage": {"indexed_items": 0, "known_items": known_items, "indexed_files": 0},
+                "coverage": {"indexed_items": 0, "known_items": known_items,
+                             "indexed_files": 0, "modern_search_files": 0,
+                             "searched_files": 0},
                 "matches": []}
     query_signature = minhash_signature(
         ["g:" + h for h in fp["features"]] +
@@ -565,15 +572,8 @@ def scan(db, path, limit=5):
     modern = search_index.candidates(db, fp, total_files, limit=150)
     legacy = []
     legacy_df = {}
-    old_query = None
-    if search_files < total_files:
-        try:
-            old_query = fingerprint_file(path, legacy=True)
-        except ValueError:
-            # A controller-only vehicle may have no legacy geometry at all.
-            pass
-        else:
-            legacy, legacy_df = _legacy_candidates(db, old_query, total_files)
+    if legacy_fp is not None and search_files < total_files:
+        legacy, legacy_df = _legacy_candidates(db, legacy_fp, total_files)
     selected = {}
     for item_id, candidate_path, votes in modern:
         selected[(item_id, candidate_path)] = (False, votes)
@@ -609,7 +609,7 @@ def scan(db, path, limit=5):
                   search_index.load(db, item_id, candidate_path))
         if theirs is None:
             continue
-        result = _rank_match(db, old_query if is_legacy else fp, theirs,
+        result = _rank_match(db, legacy_fp if is_legacy else fp, theirs,
                              item_id, candidate_path, total_files,
                              legacy_df if is_legacy else df,
                              legacy=is_legacy, query_signature=query_signature)
@@ -632,8 +632,29 @@ def scan(db, path, limit=5):
             "query_neighborhoods": sum(fp["features"].values()),
             "coverage": {"indexed_items": indexed_items, "known_items": known_items,
                          "indexed_files": total_files, "modern_search_files": modern_files,
+                         "searched_files": searched_files,
                          "discovery_complete": get_state(db, "discovery_complete_v2_published") == "1",
                          "last_discovery": get_state(db, "last_discovery")},
             "best_match": best, "matches": results[:limit],
             "note": "Similarity measures directional structural overlap; confidence is heuristic, "
-                    "not proof of copying. Only indexed public/downloadable files were checked."}
+                    "not proof of copying. Only indexed public/downloadable files were checked."
+                    + (f" Fingerprint search covered {searched_files:,} of "
+                       f"{total_files:,} indexed files; upgrade the index to cover the rest."
+                       if searched_files < total_files else "")}
+
+
+def scan(db, path, limit=5):
+    """Compare a local XML file, including legacy index rows where available."""
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    fp = fingerprint_file(path)
+    total_files = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    search_files = db.execute("SELECT COUNT(*) FROM search_files").fetchone()[0]
+    legacy_fp = None
+    if search_files < total_files:
+        try:
+            legacy_fp = fingerprint_file(path, legacy=True)
+        except ValueError:
+            # A controller-only vehicle may have no legacy geometry at all.
+            pass
+    return scan_fingerprint(db, fp, limit=limit, legacy_fp=legacy_fp)
