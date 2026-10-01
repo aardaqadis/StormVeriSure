@@ -5,6 +5,7 @@ service does not accept paths or download Workshop content during a request.
 """
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import closing
 import hmac
 import ipaddress
 import json
@@ -14,7 +15,6 @@ import re
 import socket
 import sqlite3
 import threading
-
 from .fingerprint import MAX_COMPONENTS
 from .index import get_state, scan_fingerprint
 from .search_index import SEARCH_INDEX_VERSION
@@ -23,6 +23,7 @@ from .search_index import SEARCH_INDEX_VERSION
 MAX_FINGERPRINT_BYTES = 64 * 1024 * 1024
 MAX_FINGERPRINT_KEYS = 500_000
 MAX_CONCURRENT_SCANS = 4
+MAX_CONNECTION_THREADS = 16
 _HASH = re.compile(r"[0-9a-f]{24}\Z")
 _FEATURE_FIELDS = ("features", "winnow_features", "logic_features", "micro_features")
 _SAMPLE_FIELDS = ("samples", "winnow_samples", "logic_samples", "micro_samples")
@@ -51,15 +52,15 @@ def _read_only_db(path):
 
 def _coverage(db):
     indexed_files = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-    search_files = db.execute("SELECT COUNT(*) FROM search_files").fetchone()[0]
+    modern_files = db.execute(
+        "SELECT COUNT(*) FROM search_files WHERE version=?",
+        (SEARCH_INDEX_VERSION,)).fetchone()[0]
     return {
         "indexed_items": db.execute(
             "SELECT COUNT(DISTINCT item_id) FROM files").fetchone()[0],
         "indexed_files": indexed_files,
-        "searched_files": search_files,
-        "modern_search_files": db.execute(
-            "SELECT COUNT(*) FROM search_files WHERE version=?",
-            (SEARCH_INDEX_VERSION,)).fetchone()[0],
+        "searched_files": modern_files,
+        "modern_search_files": modern_files,
         "known_items": db.execute("SELECT COUNT(*) FROM items").fetchone()[0],
         "discovery_complete": get_state(db, "discovery_complete_v2_published") == "1",
     }
@@ -148,6 +149,8 @@ def make_server(db_path, host="127.0.0.1", port=8766, token=None):
     if not 0 <= port <= 65535:
         raise ValueError("Port must be from 0 to 65535")
     db_path = Path(db_path)
+    with closing(_read_only_db(db_path)) as db:
+        _coverage(db)
     scan_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SCANS)
 
     class Handler(BaseHTTPRequestHandler):
@@ -175,11 +178,11 @@ def make_server(db_path, host="127.0.0.1", port=8766, token=None):
             if not self._authorized():
                 self._json(401, {"error": "Authentication required"})
                 return
-            if self.path not in ("/health", "/v1/coverage"):
+            if self.path not in ("/", "/health", "/v1/coverage"):
                 self._json(404, {"error": "Unknown endpoint"})
                 return
             try:
-                with _read_only_db(db_path) as db:
+                with closing(_read_only_db(db_path)) as db:
                     coverage = _coverage(db)
             except (OSError, sqlite3.Error):
                 self._json(503, {"error": "Workshop fingerprint index is unavailable"})
@@ -219,7 +222,7 @@ def make_server(db_path, host="127.0.0.1", port=8766, token=None):
                 self.connection.settimeout(30)
                 raw = self.rfile.read(size)
                 if len(raw) != size:
-                    self._json(400, {"error": "Incomplete fingerprint request"})
+                    self._json(400, {"error": "Incomplete request body"})
                     return
                 try:
                     data = json.loads(raw)
@@ -228,7 +231,7 @@ def make_server(db_path, host="127.0.0.1", port=8766, token=None):
                     self._json(422, {"error": str(exc)})
                     return
                 try:
-                    with _read_only_db(db_path) as db:
+                    with closing(_read_only_db(db_path)) as db:
                         result = scan_fingerprint(db, fp)
                 except (OSError, sqlite3.Error):
                     self._json(503, {"error": "Workshop fingerprint index is unavailable"})
@@ -242,11 +245,37 @@ def make_server(db_path, host="127.0.0.1", port=8766, token=None):
     class SearchServer(ThreadingHTTPServer):
         daemon_threads = True
 
+        def __init__(self, *args, **kwargs):
+            self._connection_slots = threading.BoundedSemaphore(MAX_CONNECTION_THREADS)
+            super().__init__(*args, **kwargs)
+
+        def get_request(self):
+            connection, address = super().get_request()
+            # Bound the time an accepted connection may spend sending headers.
+            connection.settimeout(15)
+            return connection, address
+
+        def process_request(self, request, client_address):
+            if not self._connection_slots.acquire(blocking=False):
+                self.shutdown_request(request)
+                return
+            try:
+                super().process_request(request, client_address)
+            except BaseException:
+                self._connection_slots.release()
+                raise
+
+        def process_request_thread(self, request, client_address):
+            try:
+                super().process_request_thread(request, client_address)
+            finally:
+                self._connection_slots.release()
+
     return SearchServer((host, port), Handler)
 
 
 def serve_search(db_path, host="127.0.0.1", port=8766):
     with make_server(db_path, host, port) as server:
         address = server.server_address
-        print(f"Fingerprint search ready at http://{address[0]}:{address[1]}/v1/coverage")
+        print(f"Stormworks fingerprint service ready at http://{address[0]}:{address[1]}/")
         server.serve_forever()

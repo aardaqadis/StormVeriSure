@@ -12,6 +12,7 @@ import urllib.parse
 from unittest.mock import patch
 from types import SimpleNamespace
 
+import stormcopy.search_index as search_index
 from stormcopy.fingerprint import fingerprint_bytes
 from stormcopy.__main__ import main as cli_main
 from stormcopy.index import connect, ensure_download_columns, index_directory, index_file, scan, upsert_item
@@ -27,6 +28,38 @@ def vehicle(parts, reverse=False, author="A"):
 
 
 class DetectorTests(unittest.TestCase):
+    def test_scan_loads_each_candidate_fingerprint_once(self):
+        parts = [(x, 0, z, "wedge" if (x + z) % 4 == 0 else "block")
+                 for x in range(8) for z in range(8)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.xml"
+            other = root / "other.xml"
+            submitted = root / "submitted.xml"
+            source.write_bytes(vehicle(parts))
+            other.write_bytes(vehicle([(x, y, z, "wheel") for x, y, z, _ in parts]))
+            submitted.write_bytes(vehicle(parts, reverse=True, author="B"))
+            db = connect(root / "index.sqlite")
+            try:
+                index_file(db, source, "123", "Source")
+                index_file(db, other, "456", "Other")
+                selected = [("123", str(source), 10.0),
+                            ("456", str(other), 1.0)]
+                loaded = []
+                original_load = search_index.load
+
+                def counting_load(connection, item_id, path):
+                    loaded.append((item_id, path))
+                    return original_load(connection, item_id, path)
+
+                with patch("stormcopy.index.search_index.candidates", return_value=selected), \
+                     patch("stormcopy.index.search_index.load", side_effect=counting_load):
+                    result = scan(db, submitted)
+                self.assertEqual(result["best_match"]["item_id"], "123")
+                self.assertEqual(loaded, [("123", str(source)), ("456", str(other))])
+            finally:
+                db.close()
+
     def test_reorder_metadata_and_translation(self):
         parts = [(x, 0, z, "wedge" if (x + z) % 4 == 0 else "block")
                  for x in range(10) for z in range(10)]

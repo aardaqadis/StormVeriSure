@@ -89,6 +89,7 @@ class PipelineTests(unittest.TestCase):
                 index_file(db, source, "1000", "Small source")
                 result = scan(db, query)
                 self.assertEqual(result["best_match"]["item_id"], "1000")
+                self.assertTrue(result["best_match"]["listed_in_known_ids"])
                 self.assertEqual(result["best_match"]["similarity_percent"], 100.0)
                 self.assertEqual(result["best_match"]["confidence"], "low")
             finally:

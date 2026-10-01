@@ -528,8 +528,11 @@ def _rank_match(db, query, theirs, item_id, candidate_path, total_files, df, leg
             minhash_bands(tuple(theirs["minhash_signature"]))):
         estimate_pct = round(100 * minhash_estimate(query_signature,
                                                     tuple(theirs["minhash_signature"])), 1)
+    # The items primary-key B-tree checks a candidate ID in logarithmic time.
+    # A local catalog entry does not verify publication or establish copying.
     item = db.execute("SELECT title FROM items WHERE id=?", (item_id,)).fetchone()
     return {"item_id": item_id, "title": item["title"] if item else None,
+            "listed_in_known_ids": bool(item is not None and item_id.isdigit()),
             "url": (f"https://steamcommunity.com/sharedfiles/filedetails/?id={item_id}"
                     if item_id.isdigit() else None),
             "file": candidate_path, "similarity_percent": round(query_pct, 1),
@@ -558,7 +561,9 @@ def scan_fingerprint(db, fp, limit=5, legacy_fp=None):
     search_files = db.execute("SELECT COUNT(*) FROM search_files").fetchone()[0]
     modern_files = db.execute("SELECT COUNT(*) FROM search_files WHERE version=?",
                               (search_index.SEARCH_INDEX_VERSION,)).fetchone()[0]
-    searched_files = total_files if legacy_fp is not None else search_files
+    # Older search rows may contain hashes from a previous canonicalization.
+    # Count only current-version rows as reliably covered by a remote query.
+    searched_files = total_files if legacy_fp is not None else modern_files
     if not total_files:
         return {"status": "no index", "suspicion_level": "unknown",
                 "message": "Index Workshop XML first.",
@@ -579,36 +584,31 @@ def scan_fingerprint(db, fp, limit=5, legacy_fp=None):
         selected[(item_id, candidate_path)] = (False, votes)
     for (item_id, candidate_path), votes in legacy:
         selected.setdefault((item_id, candidate_path), (True, votes))
-    # Exact reranking uses full compressed fingerprints. Only sampled hashes
-    # that actually overlap a returned candidate need document frequencies;
-    # this avoids probing thousands of unrelated query hashes at scale.
+    # Exact reranking uses full compressed fingerprints. Count only sampled
+    # hashes overlapping each candidate, and reuse frequencies seen earlier.
+    # Keeping one decoded candidate at a time avoids both duplicate loads and
+    # a large peak allocation when the bounded candidate list is full.
     sampled = {field: set(search_index.sampled_hashes(fp, field))
                for field in ("features", "winnow_features",
                              "logic_features", "micro_features")}
-    relevant = {field: set() for field in sampled}
-    available = []
+    checked = {field: set() for field in sampled}
+    cap = max(2, total_files // 100)
+    df = {}
+    results = []
     for (item_id, candidate_path), (is_legacy, _) in selected.items():
         theirs = (_legacy_fingerprint(db, item_id, candidate_path) if is_legacy else
                   search_index.load(db, item_id, candidate_path))
         if theirs is None:
             continue
-        available.append((item_id, candidate_path, is_legacy))
         if not is_legacy:
-            for field in sampled:
-                relevant[field].update(sampled[field].intersection(theirs[field]))
-    cap = max(2, total_files // 100)
-    df = {}
-    for field, code in (("features", "g"), ("winnow_features", "w"),
-                        ("logic_features", "l"), ("micro_features", "m")):
-        counts = search_index.document_frequencies(db, relevant[field], code, cap=cap)
-        prefix = "" if code == "g" else code + ":"
-        df.update({prefix + h: n for h, n in counts.items()})
-    results = []
-    for item_id, candidate_path, is_legacy in available:
-        theirs = (_legacy_fingerprint(db, item_id, candidate_path) if is_legacy else
-                  search_index.load(db, item_id, candidate_path))
-        if theirs is None:
-            continue
+            for field, code in (("features", "g"), ("winnow_features", "w"),
+                                ("logic_features", "l"), ("micro_features", "m")):
+                unseen = sampled[field].intersection(theirs[field]) - checked[field]
+                if unseen:
+                    checked[field].update(unseen)
+                    counts = search_index.document_frequencies(db, unseen, code, cap=cap)
+                    prefix = "" if code == "g" else code + ":"
+                    df.update({prefix + h: n for h, n in counts.items()})
         result = _rank_match(db, legacy_fp if is_legacy else fp, theirs,
                              item_id, candidate_path, total_files,
                              legacy_df if is_legacy else df,

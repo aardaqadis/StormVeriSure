@@ -12,7 +12,6 @@ from .index import (connect, ensure_download_columns, index_directory, scan, ups
                     upgrade_search_index)
 from .steam import (AUTO_REFRESH_INTERVAL_SECONDS, discover, discover_catalog,
                     download_pending, refresh_sizes, refresh_tags, setup_steamcmd)
-from .web import serve
 
 
 def _scan_path(value, prompt_stream=None):
@@ -135,8 +134,11 @@ def main():
     p = sub.add_parser("gui", help="open the plain Tkinter XML comparison window")
     p.add_argument("--workshop-folder", help="existing local Steam Workshop folder")
     sub.add_parser("status", help="show how many Workshop files are currently indexed")
-    p = sub.add_parser("serve", help="localhost upload interface")
-    p.add_argument("--port", type=int, default=8765)
+    p = sub.add_parser("serve-search", help="share the indexed Workshop fingerprints for remote comparisons")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="address to listen on (default: 127.0.0.1)")
+    p.add_argument("--port", type=int, default=8766,
+                   help="port to listen on (default: 8766)")
     for command_parser in sub.choices.values():
         command_parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                                     help="machine-readable result instead of a report")
@@ -144,15 +146,17 @@ def main():
                                     help="disable terminal colours")
     args = parser.parse_args()
     if args.db is None:
-        args.db = "workshop.sqlite" if args.command == "gui" else "stormcopy.sqlite"
+        args.db = ("workshop.sqlite" if args.command in ("gui", "serve-search")
+                   else "stormcopy.sqlite")
     console = Console(json_mode=args.json, color=not args.no_color)
     try:
         if args.command == "gui":
             from .gui import launch
             launch(db_path=args.db, workshop_folder=args.workshop_folder)
             return
-        if args.command == "serve":
-            serve(args.db, args.port)
+        if args.command == "serve-search":
+            from .search_service import serve_search
+            serve_search(args.db, args.host, args.port)
             return
         if args.command == "setup-steamcmd":
             console.render(args.command, setup_steamcmd(args.cache, args.force))

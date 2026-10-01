@@ -1,7 +1,7 @@
 """Offline behavior tests for the resumable Workshop catalog crawler."""
 
 from contextlib import redirect_stdout
-from io import StringIO
+from io import BytesIO, StringIO
 import json
 from pathlib import Path
 import sys
@@ -41,6 +41,15 @@ class CatalogDiscoveryTests(unittest.TestCase):
         self.addCleanup(self.folder.cleanup)
         self.db = connect(Path(self.folder.name) / "catalog.sqlite")
         self.addCleanup(self.db.close)
+
+    def test_api_json_tolerates_invalid_utf8_in_workshop_title(self):
+        response = BytesIO(b'{"response":{"publishedfiledetails":['
+                           b'{"title":"broken \xff title"}]}}')
+        with patch("stormcopy.steam.urllib.request.urlopen", return_value=response), \
+             patch("stormcopy.steam.time.sleep"):
+            result = steam._request_json("https://example.invalid", 0)
+        self.assertEqual(result["response"]["publishedfiledetails"][0]["title"],
+                         "broken \ufffd title")
 
     def test_full_crawl_checkpoints_cursor_then_switches_to_updated_refresh(self):
         clock = [2_000_000]

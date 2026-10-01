@@ -7,6 +7,7 @@ about a creation, so callers should make remote searching an explicit choice.
 
 import ipaddress
 import json
+import math
 from pathlib import Path
 import socket
 from urllib import error, parse, request
@@ -101,6 +102,8 @@ def _request_json(url, *, data=None, token=None, timeout=DEFAULT_TIMEOUT):
             message = details.get("error")
         except RemoteSearchError:
             message = None
+        finally:
+            exc.close()
         if not isinstance(message, str) or not message.strip():
             message = "Search server rejected the request."
         raise RemoteSearchError(f"{message} (HTTP {exc.code})") from exc
@@ -125,6 +128,93 @@ def _validate_coverage(coverage):
                 raise RemoteSearchError(f"Search server response has invalid {key} coverage.")
 
 
+def _nonnegative_integer(value):
+    return type(value) is int and value >= 0
+
+
+def _percentage(value):
+    # Check the range before converting to float; a valid JSON integer can be
+    # large enough for math.isfinite() to raise OverflowError.
+    return (type(value) in (int, float) and 0 <= value <= 100 and
+            math.isfinite(value))
+
+
+def _validate_match(match):
+    """Validate fields the GUI renders or opens from an untrusted service."""
+    if not isinstance(match, dict):
+        raise RemoteSearchError("Search server returned an invalid match.")
+    item_id = match.get("item_id")
+    if not isinstance(item_id, str) or not item_id or len(item_id) > 256:
+        raise RemoteSearchError("Search server returned an invalid Workshop item ID.")
+    if match.get("title") is not None and not isinstance(match["title"], str):
+        raise RemoteSearchError("Search server returned an invalid Workshop title.")
+    for field in ("similarity_percent", "workshop_coverage_percent",
+                  "combined_similarity_percent"):
+        if not _percentage(match.get(field)):
+            raise RemoteSearchError(f"Search server returned invalid {field}.")
+    estimate = match.get("minhash_jaccard_estimate_percent")
+    if estimate is not None and not _percentage(estimate):
+        raise RemoteSearchError("Search server returned an invalid MinHash estimate.")
+    if match.get("confidence") not in ("low", "medium", "high"):
+        raise RemoteSearchError("Search server returned invalid match confidence.")
+    for field in ("shared_neighborhoods", "rare_shared_neighborhoods"):
+        if not _nonnegative_integer(match.get(field)):
+            raise RemoteSearchError(f"Search server returned invalid {field}.")
+    for field in ("partial_copy_evidence", "semantic_copy_evidence"):
+        if field in match and type(match[field]) is not bool:
+            raise RemoteSearchError(f"Search server returned invalid {field}.")
+
+    channels = match.get("channels", {})
+    if not isinstance(channels, dict):
+        raise RemoteSearchError("Search server returned invalid matched data channels.")
+    for name, channel in channels.items():
+        if (not isinstance(name, str) or not isinstance(channel, dict) or
+                not _nonnegative_integer(channel.get("shared")) or
+                not _percentage(channel.get("query_coverage_percent"))):
+            raise RemoteSearchError("Search server returned invalid matched data channels.")
+
+    url = match.get("url")
+    expected_url = (f"https://steamcommunity.com/sharedfiles/filedetails/?id={item_id}"
+                    if item_id.isdigit() else None)
+    if url is not None and (not isinstance(url, str) or url != expected_url):
+        raise RemoteSearchError("Search server returned an invalid Workshop URL.")
+
+    evidence = match.get("evidence")
+    if not isinstance(evidence, list):
+        raise RemoteSearchError("Search server returned invalid match evidence.")
+    for entry in evidence:
+        if not isinstance(entry, dict):
+            raise RemoteSearchError("Search server returned invalid match evidence.")
+        if not isinstance(entry.get("channel"), str) or not entry["channel"]:
+            raise RemoteSearchError("Search server returned invalid evidence channel.")
+        if not _nonnegative_integer(entry.get("matching_components")):
+            raise RemoteSearchError("Search server returned invalid evidence count.")
+        for field in ("query_position", "workshop_position"):
+            position = entry.get(field)
+            if position is not None and (not isinstance(position, list) or
+                    len(position) != 3 or any(type(value) is not int for value in position)):
+                raise RemoteSearchError("Search server returned invalid evidence position.")
+
+
+def _validate_scan_result(result):
+    if (not isinstance(result.get("status"), str) or not result["status"] or
+            not isinstance(result.get("suspicion_level"), str) or
+            not result["suspicion_level"] or
+            not isinstance(result.get("matches"), list)):
+        raise RemoteSearchError("Search server returned an incomplete comparison result.")
+    _validate_coverage(result.get("coverage"))
+    best = result.get("best_match")
+    if best is not None:
+        _validate_match(best)
+    for match in result["matches"]:
+        _validate_match(match)
+    if best is not None and (not result["matches"] or
+                             best != result["matches"][0]):
+        raise RemoteSearchError("Search server returned inconsistent best-match information.")
+    if best is None and result["matches"]:
+        raise RemoteSearchError("Search server returned matches without a best match.")
+
+
 def scan_remote(path, endpoint, token=None, timeout=DEFAULT_TIMEOUT):
     """Compare a local XML against a shared index without uploading the XML.
 
@@ -141,16 +231,7 @@ def scan_remote(path, endpoint, token=None, timeout=DEFAULT_TIMEOUT):
     if len(encoded) > MAX_REQUEST_BYTES:
         raise RemoteSearchError("This vehicle's fingerprints exceed the server's 64 MiB request limit.")
     result = _request_json(url, data=encoded, token=token, timeout=timeout)
-    if (not isinstance(result.get("status"), str) or
-            not isinstance(result.get("suspicion_level"), str) or
-            not isinstance(result.get("matches"), list)):
-        raise RemoteSearchError("Search server returned an incomplete comparison result.")
-    _validate_coverage(result.get("coverage"))
-    best = result.get("best_match")
-    if best is not None and not isinstance(best, dict):
-        raise RemoteSearchError("Search server returned an invalid best match.")
-    if any(not isinstance(match, dict) for match in result["matches"]):
-        raise RemoteSearchError("Search server returned an invalid match list.")
+    _validate_scan_result(result)
     return result
 
 

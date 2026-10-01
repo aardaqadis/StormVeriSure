@@ -1,6 +1,6 @@
 # Stormworks Copy Detector
 
-A local tool for comparing a Stormworks vehicle XML with **the Workshop files you have indexed**. Python 3.10+ is the only runtime dependency. The index and Steam downloads persist across scans. The plain Tkinter window is the quickest way to scan; the command line and local browser page remain available.
+A tool for comparing a Stormworks vehicle XML with **the Workshop files you have indexed locally or in a shared index**. Python 3.10+ is the only runtime dependency. The index and Steam downloads persist across scans. Use the Tkinter window or command line; the shared search service provides a fingerprint API without a browser upload page.
 
 ## Quick start
 
@@ -10,7 +10,15 @@ Double-click `start-gui.bat`, or run this from the project folder:
 py -3 -m stormcopy
 ```
 
-Choose a vehicle XML and click Compare. The window searches the saved index immediately and shows the best match, evidence, and the number of Workshop files actually indexed. It checks the installed Workshop folder for new files in the background and updates the comparison after indexing them. Repeated comparisons reuse the saved fingerprints; they do not download the Workshop again. The Debug section shows progress and local resource information.
+Choose a vehicle XML and click **Compare locally**. The Results tab shows colour-coded certainty and tables for the main match, up to three possible matches, matching data types, matching positions, and program/index information. It shows the percentage of the input vehicle's structure that overlaps, the Workshop link, elapsed comparison time, and the app's current process memory use. The best match's public Workshop description loads in the background when available. The Debug resources tab shows activity and local resource information.
+
+The **3D previews** tab shows the input beside a selected locally stored Workshop match. Choose among reported matches with the **Workshop match** selector. Each vehicle is shown as individual grid cubes in a rotatable 3D view and top, side, and front views. Green marks the same component type at an aligned position, yellow marks a changed type at an aligned position, red marks a position with no corresponding cube, and gray means spatial alignment could not be verified. The alignment uses shared structural evidence from the scan or strong agreement across the complete geometry; these colours are a preview of grid correspondence, not a separate copy verdict. Drag a 3D view to rotate both vehicles or scroll to zoom. The viewer processes every positioned component within the 500,000-component file limit. Each view is one depth-tested image, so hidden interior cubes are naturally occluded; it does not reconstruct Stormworks meshes, moving bodies, or paint. A shared match with no local XML shows an unavailable message.
+
+The **Known Workshop IDs** tab pages through the saved ID catalog 100 at a time and supports exact ID lookup without loading all IDs into memory. **Find ID** looks up one saved number. **Find IDs** traverses Steam's publicly discoverable Stormworks listing, saving each page of IDs and showing the page and saved-ID counts. Click **Stop finding IDs** to pause; another **Find IDs** click resumes the saved cursor. A completed full pass starts from the beginning when requested again. A saved Steam Web API key is required. Automatic discovery also resumes in one-page background steps about once per minute and backs off after errors or a completed refresh. Steam cannot provide private, removed, or inaccessible IDs. New IDs are metadata only until their XML is downloaded and indexed.
+
+The window searches the saved index immediately and reports how many Workshop files are actually searchable. It checks the installed Workshop folder for new files in the background and updates a local comparison after indexing them. Repeated comparisons reuse the saved fingerprints; they do not download the Workshop again. The memory figure is the application's working set after the scan, not a precise allocation for that one comparison.
+
+The certainty column uses **High**, **Medium**, **Low**, **Holds some matched microcontrollers**, **Uncertain**, or **No match found**. These are heuristic labels. **Uncertain** includes an empty or partly upgraded index; **No match found** means no reportable match among the files actually searched. The percentage describes how much of the input vehicle's structure overlaps, not the probability of copying. A controller-only match can have 0% structural overlap while still showing controller evidence.
 
 Steam's Workshop search API does not search inside uploaded XML files. Comparing against every public Workshop vehicle requires first obtaining and indexing each accessible file; the window reports the current local coverage rather than claiming a complete remote search.
 
@@ -32,6 +40,26 @@ py -3 -m stormcopy --db workshop.sqlite upgrade-index
 The upgrade commits files in small batches and resumes after the last committed batch when rerun. `upgrade-index --max-files 100` limits one run to 100 available files. `status` shows how many files have the current MinHash/LSH fingerprints. Missing source XML stays in the older searchable index; if you obtain it again, rerun `index-dir` on its folder or rerun the upgrade. A newly downloaded or indexed XML gets the new search data automatically.
 
 While an index or download run is active, open another Command Prompt in this folder and run `py -3 -m stormcopy --db workshop.sqlite status` to see indexed vehicles, cached items, and the remaining known download queue.
+
+## Search a shared fingerprint index
+
+A computer with an indexed Workshop collection can answer comparisons for other computers. The host keeps its `workshop.sqlite` and Workshop files; a client sends structural fingerprints of its chosen XML and receives ranked Workshop matches and coverage counts. The host does not download new items during a search. It reads the current SQLite index for each request, so later indexing runs improve subsequent searches without restarting the service.
+
+On the computer holding the index, double-click `start-search-service.bat` or run this in Command Prompt:
+
+```bat
+py -3 -m stormcopy --db workshop.sqlite serve-search
+```
+
+This listens only on `127.0.0.1:8766`. It exposes JSON status at `/` and `/v1/coverage`, and accepts structural fingerprint JSON at `/v1/scan`. It has no browser upload page and does not accept raw XML. Use `py -3 -m stormcopy --db workshop.sqlite status` for detailed local index status. Keep the service running while comparing; restart it after updating the program.
+
+In the Tkinter window, choose the vehicle XML, enter `http://127.0.0.1:8766` in **Shared index URL**, and click **Search shared index**. Leave **Access token** empty for an unprotected service running only on your own computer. **Compare locally** still searches the SQLite index on the client's computer. For a service hosted elsewhere, enter its HTTPS URL and access token instead.
+
+To make the index available to another computer, use an HTTPS reverse proxy with a valid certificate and a long secret access token. Set `STORMCOPY_SEARCH_TOKEN` in the host's environment before starting `serve-search`, then configure the client with the HTTPS address and the same token. Keep `serve-search` bound to `127.0.0.1` when the proxy runs on the same computer; if a proxy on another machine must reach it, use `--host` with an appropriate private network address and restrict access to that address. The proxy must forward the `Authorization` header. Do not expose the plain HTTP service directly to the internet. The client accepts plain HTTP only for a loopback address and rejects redirects, so a remote address needs HTTPS from the start.
+
+When searching a shared index from Tkinter, only the XML's structural hashes, counts, and example component positions are sent; the full XML stays on the client. Fingerprints still reveal some of the creation's structure, so choose a shared server deliberately. The response includes Workshop IDs, titles, links, similarity measures, evidence, and actual index coverage, without the host's local file paths. The service does not need the Steam API key to answer scans; discovery and indexing on the host remain separate jobs.
+
+A result covers only Workshop vehicle files that the host has downloaded **and indexed**. A finished public metadata crawl is not a finished content index, and the service cannot check private, deleted, inaccessible, or still-unindexed items. The similarity and confidence figures describe overlap with the indexed collection, not proof that a creation is original or copied.
 
 ## Fill your existing Steam Workshop folder
 
@@ -78,7 +106,7 @@ At the prompt, paste the path to the XML file or drag the file into Command Prom
 py -3 -m stormcopy --db workshop.sqlite scan "C:\path\to\vehicle.xml"
 ```
 
-The file is scanned against the index; it is not added as a Workshop reference. The Command Prompt report shows the overlap status, best matching item and Workshop link, directional structure similarity, MinHash estimate, heuristic confidence, and example matching positions in readable text. Use `--json` after a command if another program needs the structured result, for example `scan "C:\path\to\vehicle.xml" --json`. Progress stays on the error stream so JSON output remains parseable. Colours appear in a compatible interactive terminal; `--no-color` or the `NO_COLOR` environment variable turns them off. Nothing is uploaded to a remote server. If you prefer the optional local browser page, run `py -3 -m stormcopy --db workshop.sqlite serve` and open `http://127.0.0.1:8765/`.
+The file is scanned against the index; it is not added as a Workshop reference. The Command Prompt report shows the overlap status, best matching item and Workshop link, directional structure similarity, MinHash estimate, heuristic confidence, and example matching positions in readable text. Use `--json` after a command if another program needs the structured result, for example `scan "C:\path\to\vehicle.xml" --json`. Progress stays on the error stream so JSON output remains parseable. Colours appear in a compatible interactive terminal; `--no-color` or the `NO_COLOR` environment variable turns them off. Nothing is uploaded to a remote server.
 
 To cache Workshop files, install Valve's [SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD). On Windows the CLI can download its bootstrap into a chosen cache folder:
 
@@ -134,7 +162,7 @@ py -3 -m stormcopy --db workshop.sqlite refresh-sizes
 py -3 -m stormcopy --db workshop.sqlite download --cache "C:\steamcmd" --max-items 100 --batch-size 10
 ```
 
-`discover` saves the next cursor, so running it again resumes. It crawls the full published listing first, then uses an updated-order search with a seven-day overlap for later runs. An explicit `discover` command starts a new refresh as soon as the previous one finishes. A full published crawl repeats every 30 days. `--pages 0` finishes the current crawl or refresh pass; a full crawl can be long. `--restart` starts a new full published crawl. `refresh-sizes` fills missing reported sizes for known IDs without an API key. HTTP 429 and transient API errors back off and retry. SteamCMD failures are recorded in SQLite. Keep the API key private and do not serve the page outside localhost.
+`discover` saves the next cursor, so running it again resumes. It crawls the full published listing first, then uses an updated-order search with a seven-day overlap for later runs. An explicit `discover` command starts a new refresh as soon as the previous one finishes. A full published crawl repeats every 30 days. `--pages 0` finishes the current crawl or refresh pass; a full crawl can be long. `--restart` starts a new full published crawl. `refresh-sizes` fills missing reported sizes for known IDs without an API key. HTTP 429 and transient API errors back off and retry. SteamCMD failures are recorded in SQLite. Keep the API key private and protect any search service exposed outside localhost.
 
 The default discovery command now handles maintenance automatically. For a manual updated-order search, `discover --sort updated --restart --pages 10` still uses its separate saved cursor. Steam offers no Workshop query sorted by size: the detector sorts only the IDs discovered so far, and the size is the primary published file's size rather than a guaranteed total installed folder size. Complete public-item coverage requires finishing the full published-order cursor pass and downloading every accessible vehicle item; private, removed, and inaccessible items remain outside the index. A complete download can require substantial time and storage.
 
@@ -143,6 +171,8 @@ The default discovery command now handles maintenance automatically. For a manua
 The detector extracts Stormworks `<c>` components with `<vp>` grid positions. It sorts XML attributes and unordered child records, normalizes decimal spellings, ignores regenerated IDs and cosmetic paint/name fields, and keeps bodies separate so two bodies at the same local coordinate do not form a false structure. It hashes component orientation/content and each radius-two neighborhood. It also builds **spatial winnowing** fingerprints from contiguous component runs along each grid axis. These runs are ordered by coordinates, so rearranging XML elements does not break them. Logic links use relative endpoint positions; substantial microprocessor scripts and internal graphs add independent evidence.
 
 Each file gets a 64-value **MinHash** sketch with 16 **LSH** buckets for close overall matches. A bounded index of rare neighborhood, winnowing, logic, and microprocessor hashes retrieves smaller copied sections that whole-vehicle LSH can miss. A scan merges those candidates, then loads compressed full fingerprints and compares exact multiset counts before ranking. New indexes store full fingerprints once per file in compressed form and keep only a bounded sample of hashes as lookup rows, limiting database growth. The saved index and download cache are reused across scans.
+
+Workshop IDs are stored in SQLite's indexed primary key, allowing sorted pages and quick lookup. Each structurally matched result is checked against that catalog. IDs alone contain no vehicle structure, so comparisons search fingerprint indexes rather than sorting the full ID list on every scan. Candidate fingerprints are loaded and ranked one at a time to keep memory use bounded.
 
 The reported **similarity percentage** is the share of the submitted vehicle's neighborhood instances found in the Workshop vehicle; `workshop_coverage_percent` measures the reverse. `combined_similarity_percent` is a heuristic blend of available geometry, winnowing, logic, and microprocessor coverage. The MinHash estimate is approximate whole-vehicle set Jaccard and can be low even when a real 20% section matches. Evidence includes matching neighborhood and sequence positions; a cluster of nearby rare matches can raise a partial-copy result to medium suspicion. A high label still requires broad rare structural overlap.
 

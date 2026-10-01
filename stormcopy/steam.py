@@ -175,7 +175,9 @@ def _request_json(url, delay, data=None):
                 headers["Content-Type"] = "application/x-www-form-urlencoded"
             req = urllib.request.Request(url, data=data, headers=headers)
             with urllib.request.urlopen(req, timeout=30) as response:
-                result = json.load(response)
+                # Some Workshop titles/descriptions contain invalid UTF-8.
+                # Preserve the JSON structure and replace only those bytes.
+                result = json.loads(response.read().decode("utf-8", "replace"))
             time.sleep(delay)
             return result
         except urllib.error.HTTPError as exc:
@@ -421,7 +423,7 @@ def refresh_recent(db, max_pages=1, delay=2.0, api_key=None, tags=(),
 
 def discover_catalog(db, max_pages=1, delay=2.0, api_key=None, restart=False,
                      tags=(), excluded_tags=(), match_all=True, progress=None,
-                     refresh_interval_seconds=0):
+                     refresh_interval_seconds=0, force_full_scan=False):
     """Finish the full crawl, then perform overlapping recent-update sweeps."""
     if max_pages < 0 or delay < 0 or refresh_interval_seconds < 0:
         raise ValueError("pages, delay, and refresh interval must be nonnegative")
@@ -437,6 +439,10 @@ def discover_catalog(db, max_pages=1, delay=2.0, api_key=None, restart=False,
     refresh_completed_key = f"refresh_completed_v1{suffix}"
     refresh_watermark_key = f"refresh_watermark_v1{suffix}"
     full_complete = get_state(db, full_complete_key) == "1"
+    # A user-requested full pass restarts only a completed catalog. An
+    # interrupted pass keeps its saved cursor and continues where it stopped.
+    if force_full_scan and full_complete:
+        restart = True
     if full_complete and get_state(db, full_completed_key) is None:
         # Existing databases know their crawl finished but not when. Begin a
         # fresh 30-day schedule; no refresh watermark means one full updated
